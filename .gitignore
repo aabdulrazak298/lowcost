@@ -1,0 +1,25 @@
+# Environment secrets
+.env
+.env.*
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Generated images
+generated/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Tests output
+tests/__pycache__/

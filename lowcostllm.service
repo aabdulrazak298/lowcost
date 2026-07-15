@@ -1,0 +1,16 @@
+[Unit]
+Description=LowCostLLM — Cached LLM Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=one
+WorkingDirectory=/home/one/cloud/projects/lowcostllm
+Environment=PATH=/home/one/cloud/projects/lowcostllm/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/one/cloud/projects/lowcostllm/.venv/bin/python server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
