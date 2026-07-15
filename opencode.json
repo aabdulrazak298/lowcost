@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "lowcostllm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LowCostLLM",
+      "options": {
+        "baseURL": "http://127.0.0.1:8800/v1"
+      },
+      "models": {
+        "lowcostllm": {
+          "name": "LowCostLLM (DeepSeek V4 Pro + Flash cache)"
+        }
+      }
+    }
+  }
+}

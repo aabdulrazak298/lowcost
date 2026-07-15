@@ -23,3 +23,6 @@ __pycache__/
 
 # Tests output
 tests/__pycache__/
+
+# Logs
+server.log

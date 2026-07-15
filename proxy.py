@@ -1,11 +1,17 @@
 """Core orchestrator: match -> route -> cache -> respond."""
+import json
 import time
-from fastapi import Request
 
 from config import CHEAP_MODEL
-from db import get_all_queries, insert_qa, get_cache_stats
+from db import get_all_queries, insert_qa, search_candidates, hot_cache_lookup, hot_cache_put
 from matcher import find_best_match
-from llm import call_cheap, call_expensive
+from llm import (
+    call_cheap,
+    call_expensive,
+    call_cheap_full,
+    call_expensive_full,
+    stream_expensive_full,
+)
 from stats import record_request
 
 
@@ -28,78 +34,153 @@ answer appropriately while preserving factual accuracy.
 User's question: {user_query}"""
 
 
-async def handle_chat_completion(request: Request) -> dict:
-    """Process a /v1/chat/completions request."""
-    body = await request.json()
+def _extract_query_info(body: dict) -> tuple[str, str, list, float, int, list | None, int]:
+    """Parse common fields from request body. Returns (user_query, match_query,
+    messages, temperature, max_tokens, tools, expensive_max_tokens)."""
     messages = body.get("messages", [])
     temperature = body.get("temperature", 0.7)
     max_tokens = body.get("max_tokens", 2048)
-    # DeepSeek V4 Pro is a reasoning model — needs headroom for thinking.
-    # Ensure at least 512 tokens or reasoning may consume the entire budget.
+    tools = body.get("tools")
     expensive_max_tokens = max(max_tokens, 512)
 
-    # Build a context-aware query from recent user messages.
-    # Using only the last message loses conversation context:
-    #   "What is a VFD?" → "How to commission it?" should match VFD cache.
-    user_msgs = [m["content"] for m in messages if m.get("role") == "user"]
+    def _extract_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    t = item.get("text") or item.get("content") or ""
+                    parts.append(str(t))
+            return " ".join(parts)
+        return str(content) if content else ""
+
+    user_msgs = [_extract_text(m.get("content", "")) for m in messages if m.get("role") == "user"]
     if not user_msgs:
-        user_msgs = [m.get("content", "") for m in messages]
+        user_msgs = [_extract_text(m.get("content", "")) for m in messages]
 
-    # Last user message is the primary query; prefix with recent context
-    user_query = user_msgs[-1]
-    match_query = " ".join(user_msgs[-3:])
+    user_query = user_msgs[-1] if user_msgs else ""
+    match_query = " ".join(u for u in user_msgs[-3:] if u)
 
-    # Check cache
-    cached = get_all_queries()
-    match = find_best_match(match_query, cached)
+    return user_query, match_query, messages, temperature, max_tokens, tools, expensive_max_tokens
+
+
+def _cache_lookup(match_query: str) -> dict | None:
+    """Find best cache match: hot cache → FTS5 search → RapidFuzz."""
+    # 1. Hot cache — exact match, instant
+    hot = hot_cache_lookup(match_query)
+    if hot:
+        return hot
+
+    # 2. FTS5 pre-filter — top 100 candidates by text relevance
+    candidates = search_candidates(match_query, limit=100)
+
+    # 3. RapidFuzz on filtered candidates
+    if candidates:
+        match = find_best_match(match_query, candidates)
+        if match:
+            hot_cache_put(match_query, match)
+            return match
+
+    # 4. Fallback: full scan (for sparse FTS5 results)
+    all_entries = get_all_queries()
+    if all_entries:
+        match = find_best_match(match_query, all_entries)
+        if match:
+            hot_cache_put(match_query, match)
+            return match
+
+    return None
+
+
+async def handle_chat_completion(body: dict) -> dict:
+    """Process a /v1/chat/completions request (non-streaming)."""
+    user_query, match_query, messages, temperature, max_tokens, tools, expensive_max_tokens = (
+        _extract_query_info(body)
+    )
+
+    match = _cache_lookup(match_query)
+    response_content = None
+    response_tool_calls = None
+    model_used = CHEAP_MODEL
+    usage = None
+    finish_reason = "stop"
 
     if match:
-        # --- TRY CHEAP PATH ---
         context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
             expert_answer=match["answer"],
             user_query=user_query,
         )
-        cheap_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant. Answer accurately using "
-                    "the provided expert reference."
-                ),
-            },
-            {"role": "user", "content": context_prompt},
-        ]
-        answer = await call_cheap(cheap_messages, temperature, max_tokens)
+        cheap_messages = list(messages)
+        cheap_messages.append({"role": "user", "content": context_prompt})
 
-        # Self-check: did the cheap model reject the cached answer?
-        if answer.strip().upper().startswith("IRRELEVANT"):
-            # Cached answer was about a different topic — escalate
-            record_request(hit=False, model="irrelevant-escalated")
-            match = None  # force expensive path below
+        if tools:
+            result = await call_cheap_full(
+                cheap_messages, temperature, max_tokens, tools=tools
+            )
         else:
-            model_used = f"{CHEAP_MODEL} (cached)"
+            text = await call_cheap(cheap_messages, temperature, max_tokens)
+            result = {
+                "content": text,
+                "tool_calls": None,
+                "model": f"{CHEAP_MODEL} (cached)",
+                "usage": None,
+                "finish_reason": "stop",
+            }
+
+        if (
+            not result.get("tool_calls")
+            and result.get("content", "").strip().upper().startswith("IRRELEVANT")
+        ):
+            record_request(hit=False, model="irrelevant-escalated")
+            match = None
+        else:
+            response_content = result["content"]
+            response_tool_calls = result.get("tool_calls")
+            model_used = result.get("model", f"{CHEAP_MODEL} (cached)")
+            usage = result.get("usage")
+            finish_reason = result.get("finish_reason", "stop")
             record_request(hit=True, model=model_used)
 
     if not match:
-        # --- EXPENSIVE PATH: DeepSeek V4 Pro ---
-        # Add cache-aware system prompt so the model generates thorough,
-        # self-contained answers suitable for reuse.
-        cache_aware = [{
-            "role": "system",
-            "content": (
-                "Your answer will be cached and reused as a reference for "
-                "similar future queries. Be thorough, self-contained, and "
-                "include all relevant details so the cached version stands "
-                "alone as a complete reference."
-            ),
-        }]
-        answer, model_used = await call_expensive(
-            cache_aware + messages, temperature, expensive_max_tokens
-        )
-        insert_qa(match_query, answer, model_used)
+        cache_aware = [
+            {
+                "role": "system",
+                "content": (
+                    "Your answer will be cached and reused as a reference for "
+                    "similar future queries. Be thorough, self-contained, and "
+                    "include all relevant details so the cached version stands "
+                    "alone as a complete reference."
+                ),
+            }
+        ]
+
+        if tools:
+            result = await call_expensive_full(
+                cache_aware + messages, temperature, expensive_max_tokens, tools=tools
+            )
+        else:
+            text, model = await call_expensive(
+                cache_aware + messages, temperature, expensive_max_tokens
+            )
+            result = {
+                "content": text,
+                "tool_calls": None,
+                "model": model,
+                "usage": None,
+                "finish_reason": "stop",
+            }
+
+        response_content = result["content"]
+        response_tool_calls = result.get("tool_calls")
+        model_used = result.get("model", "deepseek-v4-pro")
+        usage = result.get("usage")
+        finish_reason = result.get("finish_reason", "stop")
+
+        insert_qa(match_query, response_content, model_used)
         record_request(hit=False, model=model_used)
 
-    return {
+    response = {
         "id": f"chatcmpl-{int(time.time())}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -109,14 +190,143 @@ async def handle_chat_completion(request: Request) -> dict:
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": answer,
+                    "content": response_content,
                 },
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
+        "usage": usage
+        or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+    if response_tool_calls:
+        response["choices"][0]["message"]["tool_calls"] = response_tool_calls
+
+    return response
+
+
+def _format_sse(chat_id: str, created: int, model: str, chunk: dict) -> str:
+    """Wrap a delta chunk into an SSE data line."""
+    data = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": chunk.get("delta", {}),
+                "finish_reason": chunk.get("finish_reason"),
+            }
+        ],
+    }
+    if chunk.get("usage"):
+        data["usage"] = chunk["usage"]
+    return f"data: {json.dumps(data)}\n\n"
+
+
+async def stream_chat_completion(body: dict):
+    """Process a /v1/chat/completions request with stream=True.
+
+    Yields SSE-formatted strings for a FastAPI StreamingResponse.
+    """
+    user_query, match_query, messages, temperature, max_tokens, tools, expensive_max_tokens = (
+        _extract_query_info(body)
+    )
+
+    chat_id = f"chatcmpl-{int(time.time())}"
+    created = int(time.time())
+
+    match = _cache_lookup(match_query)
+
+    if match:
+        # Cache hit — buffer cheap response, verify IRRELEVANT, then stream
+        context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
+            expert_answer=match["answer"],
+            user_query=user_query,
+        )
+        cheap_messages = list(messages)
+        cheap_messages.append({"role": "user", "content": context_prompt})
+
+        result = await call_cheap_full(
+            cheap_messages, temperature, max_tokens, tools=tools
+        )
+        content = result["content"]
+        tool_calls = result.get("tool_calls")
+        model_used = result.get("model", f"{CHEAP_MODEL} (cached)")
+        usage = result.get("usage")
+        finish_reason = result.get("finish_reason", "stop")
+
+        if (
+            not tool_calls
+            and content.strip().upper().startswith("IRRELEVANT")
+        ):
+            record_request(hit=False, model="irrelevant-escalated")
+            match = None
+        else:
+            # Stream buffered response
+            if tool_calls:
+                for tc in tool_calls:
+                    yield _format_sse(chat_id, created, model_used, {
+                        "delta": {"tool_calls": [tc]},
+                        "finish_reason": None,
+                    })
+                yield _format_sse(chat_id, created, model_used, {
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                })
+            else:
+                chunk_size = 16
+                for i in range(0, len(content), chunk_size):
+                    yield _format_sse(chat_id, created, model_used, {
+                        "delta": {"content": content[i : i + chunk_size]},
+                        "finish_reason": None,
+                    })
+
+                yield _format_sse(chat_id, created, model_used, {
+                    "delta": {},
+                    "finish_reason": finish_reason,
+                    "usage": usage,
+                })
+
+            yield "data: [DONE]\n\n"
+            record_request(hit=True, model=model_used)
+            return
+
+    # Cache miss (or IRRELEVANT escalated) — stream from expensive model
+    cache_aware = [
+        {
+            "role": "system",
+            "content": (
+                "Your answer will be cached and reused as a reference for "
+                "similar future queries. Be thorough, self-contained, and "
+                "include all relevant details so the cached version stands "
+                "alone as a complete reference."
+            ),
+        }
+    ]
+
+    full_text = ""
+    model_used = "deepseek-v4-pro"
+
+    try:
+        async for chunk in stream_expensive_full(
+            cache_aware + messages, temperature, expensive_max_tokens, tools=tools
+        ):
+            delta = chunk.get("delta", {}) or {}
+            full_text += delta.get("content") or ""
+            model_used = chunk.get("model") or model_used
+            yield _format_sse(chat_id, created, model_used, chunk)
+
+        yield "data: [DONE]\n\n"
+
+        if full_text:
+            insert_qa(match_query, full_text, model_used)
+        record_request(hit=False, model=model_used)
+
+    except Exception as e:
+        error_chunk = {
+            "error": {"message": str(e), "type": "server_error"},
+        }
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+        yield "data: [DONE]\n\n"

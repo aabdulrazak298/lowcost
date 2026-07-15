@@ -789,3 +789,191 @@ async def _call_expensive_fallback(
         text = data["choices"][0]["message"]["content"]
         model = f"{FALLBACK_MODEL} (fallback)"
         return text, model
+
+
+# === OpenCode-compatible full-response functions ===
+
+
+async def call_cheap_full(
+    messages: list[dict],
+    temperature: float = 0.7,
+    max_tokens: int = 8192,
+    tools: list | None = None,
+) -> dict:
+    """Call cheap model — returns full response dict with tool_calls and usage.
+
+    When `tools` is provided, they are passed through to the model and
+    returned to the caller (no local tool execution).
+    """
+    headers = {
+        "Authorization": f"Bearer {CHEAP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if _is_openrouter(CHEAP_BASE_URL):
+        headers["HTTP-Referer"] = "http://localhost:8800"
+        headers["X-Title"] = "LowCostLLM"
+
+    payload: dict = {
+        "model": CHEAP_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens or 8192,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(CHEAP_CHAT_URL, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        choice = data["choices"][0]
+        msg = choice["message"]
+
+        return {
+            "content": msg.get("content", "") or "",
+            "tool_calls": msg.get("tool_calls"),
+            "model": data.get("model", CHEAP_MODEL),
+            "usage": data.get("usage"),
+            "finish_reason": choice.get("finish_reason", "stop"),
+        }
+
+
+async def call_expensive_full(
+    messages: list[dict],
+    temperature: float = 0.7,
+    max_tokens: int = 8192,
+    tools: list | None = None,
+) -> dict:
+    """Call expensive model — returns full response dict with tool_calls and usage.
+
+    When `tools` is provided, they are passed through to the model and
+    returned to the caller (no local tool execution).
+    Falls back to FALLBACK_MODEL on API failure.
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    headers = {
+        "Authorization": f"Bearer {EXPENSIVE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload: dict = {
+        "model": EXPENSIVE_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                EXPENSIVE_CHAT_URL, json=payload, headers=headers
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choice = data["choices"][0]
+            msg = choice["message"]
+
+            return {
+                "content": msg.get("content", "") or "",
+                "tool_calls": msg.get("tool_calls"),
+                "model": data.get("model", EXPENSIVE_MODEL),
+                "usage": data.get("usage"),
+                "finish_reason": choice.get("finish_reason", "stop"),
+            }
+    except Exception:
+        _logger.exception("Expensive model failed, falling back")
+        fallback_headers = {
+            "Authorization": f"Bearer {CHEAP_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:8800",
+            "X-Title": "LowCostLLM",
+        }
+        fb_payload: dict = {
+            "model": FALLBACK_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            fb_payload["tools"] = tools
+            fb_payload["tool_choice"] = "auto"
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                CHEAP_CHAT_URL, json=fb_payload, headers=fallback_headers
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choice = data["choices"][0]
+            msg = choice["message"]
+
+            return {
+                "content": msg.get("content", "") or "",
+                "tool_calls": msg.get("tool_calls"),
+                "model": f"{FALLBACK_MODEL} (fallback)",
+                "usage": data.get("usage"),
+                "finish_reason": choice.get("finish_reason", "stop"),
+            }
+
+
+async def stream_expensive_full(
+    messages: list[dict],
+    temperature: float = 0.7,
+    max_tokens: int = 2048,
+    tools: list | None = None,
+):
+    """Stream from expensive model — yields {delta, finish_reason, model, usage} dicts.
+
+    When `tools` is provided, they are passed through and tool_call deltas
+    are relayed to the caller (no local tool execution).
+    """
+    headers = {
+        "Authorization": f"Bearer {EXPENSIVE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload: dict = {
+        "model": EXPENSIVE_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(
+            "POST", EXPENSIVE_CHAT_URL, json=payload, headers=headers
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except Exception:
+                    continue
+
+                choice = data["choices"][0]
+                delta = choice.get("delta", {})
+                finish_reason = choice.get("finish_reason")
+                model = data.get("model", EXPENSIVE_MODEL)
+                usage = data.get("usage")
+
+                yield {
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                    "model": model,
+                    "usage": usage,
+                }

@@ -10,7 +10,7 @@ DB_PATH = ROOT / "cache.db"
 
 SIMILARITY_THRESHOLD = int(os.getenv("SIMILARITY_THRESHOLD", "48"))
 CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "365"))
-CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "1000000"))  # ~800 MB
+CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "2000000"))  # ~4 GB
 
 # Cheap model (configurable — currently Qwen 3.5 Flash via OpenRouter)
 CHEAP_API_KEY = os.getenv("CHEAP_API_KEY", "")
