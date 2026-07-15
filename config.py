@@ -44,3 +44,7 @@ UPSTREAM_MAX_RETRIES = int(os.getenv("UPSTREAM_MAX_RETRIES", "3"))
 
 # Proxy auth (disabled by default — set AUTH_KEY to enable)
 AUTH_KEY = os.getenv("AUTH_KEY", "")
+
+# Rate limiting
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))

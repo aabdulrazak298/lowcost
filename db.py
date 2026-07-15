@@ -147,7 +147,13 @@ def insert_qa(query: str, answer: str, model_used: str) -> int:
         )
     conn.commit()
 
-    _hot_cache_put(str(rid), {"id": rid, "query": query, "answer": answer, "model_used": model_used, "hit_count": 0})
+    # Hot cache insert is best-effort — skip if lock contention
+    try:
+        _hot_cache[str(rid)] = {"id": rid, "query": query, "answer": answer, "model_used": model_used, "hit_count": 0}
+        if len(_hot_cache) >= HOT_CACHE_MAX:
+            _hot_cache.popitem(last=False)
+    except Exception:
+        pass
     return rid
 
 
@@ -228,12 +234,6 @@ def get_cache_stats() -> dict:
 
 
 # -- Hot cache (LRU via OrderedDict) --------------------------------
-
-def _hot_cache_put(key: str, entry: dict) -> None:
-    if len(_hot_cache) >= HOT_CACHE_MAX:
-        _hot_cache.popitem(last=False)  # evict least recently used
-    _hot_cache[key] = entry
-
 
 def _hot_cache_bump(cache_id: int) -> None:
     for k in list(_hot_cache.keys()):

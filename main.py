@@ -1,16 +1,20 @@
 """FastAPI application for LowCostLLM."""
 import asyncio
+import hashlib
 import json
 import logging
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from db import init_db
 from proxy import handle_chat_completion, stream_chat_completion
 from webhook import handle_webhook_chat
-from config import AUTH_KEY
+from config import AUTH_KEY, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +25,17 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+_start_time = time.monotonic()
+
+# Rate limiting — per-IP sliding window
+_rate_windows: dict[str, deque[float]] = defaultdict(lambda: deque())
+_rate_lock = asyncio.Lock()
+
+# Request dedup — fingerprint → expiry
+_dedup: dict[str, float] = {}
+_dedup_lock = asyncio.Lock()
+_DEDUP_TTL = 5  # seconds
 
 
 @asynccontextmanager
@@ -55,7 +70,7 @@ async def _periodic_flush(interval: int = 30):
             logger.exception("Periodic stats flush failed")
 
 
-app = FastAPI(title="LowCostLLM", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="LowCostLLM", version="0.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,6 +78,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(GZipMiddleware, minimum_size=512)
+
+
+@app.middleware("http")
+async def rate_limiter(request: Request, call_next):
+    """Sliding-window rate limiter per client IP."""
+    client = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    window = RATE_LIMIT_WINDOW
+    limit = RATE_LIMIT_REQUESTS
+
+    async with _rate_lock:
+        dq = _rate_windows[client]
+        while dq and dq[0] < now - window:
+            dq.popleft()
+        if len(dq) >= limit:
+            return JSONResponse(
+                {"error": {"message": "Rate limit exceeded", "type": "rate_limit"}},
+                status_code=429,
+            )
+        dq.append(now)
+
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def request_logger(request: Request, call_next):
+    start = time.monotonic()
+    response = await call_next(request)
+    elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+    logger.info(json.dumps({
+        "method": request.method,
+        "path": request.url.path,
+        "status": response.status_code,
+        "ms": elapsed_ms,
+    }))
+    return response
 
 
 async def auth_dependency(request: Request):
@@ -72,13 +125,43 @@ async def auth_dependency(request: Request):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+async def _check_dedup(body: dict) -> bool:
+    """Return True if this request is a duplicate within TTL window."""
+    fingerprint = hashlib.sha256(
+        json.dumps(body.get("messages", []), sort_keys=True).encode()
+    ).hexdigest()
+    now = time.monotonic()
+    async with _dedup_lock:
+        if fingerprint in _dedup and _dedup[fingerprint] > now:
+            return True
+        _dedup[fingerprint] = now + _DEDUP_TTL
+    # Prune expired entries
+    async with _dedup_lock:
+        expired = [k for k, v in _dedup.items() if v <= now]
+        for k in expired:
+            del _dedup[k]
+    return False
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    try:
+        from db import get_conn
+        conn = get_conn()
+        conn.execute("SELECT 1")
+    except Exception:
+        return JSONResponse(
+            {"status": "unhealthy", "db": "unreachable"},
+            status_code=503,
+        )
+    return {
+        "status": "ok",
+        "uptime_seconds": round(time.monotonic() - _start_time),
+    }
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(auth=Depends(auth_dependency)):
     return {
         "object": "list",
         "data": [
@@ -99,6 +182,11 @@ async def chat_completions(request: Request, auth=Depends(auth_dependency)):
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                 },
+            )
+        if await _check_dedup(body):
+            return JSONResponse(
+                {"error": {"message": "Duplicate request", "type": "dedup"}},
+                status_code=409,
             )
         result = await handle_chat_completion(body)
         return JSONResponse(result)

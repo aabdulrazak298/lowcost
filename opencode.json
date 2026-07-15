@@ -5,7 +5,8 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "LowCostLLM",
       "options": {
-        "baseURL": "http://127.0.0.1:8800/v1"
+        "baseURL": "http://127.0.0.1:8800/v1",
+        "apiKey": "sk-lowcost-92c5efd0a86142a39aa132d8"
       },
       "models": {
         "lowcostllm": {
