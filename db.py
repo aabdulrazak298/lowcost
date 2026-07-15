@@ -367,10 +367,23 @@ def _init_stats_table(conn: sqlite3.Connection) -> None:
             expensive_calls         INTEGER NOT NULL DEFAULT 0,
             cheap_calls             INTEGER NOT NULL DEFAULT 0,
             tool_calls_total        INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens           INTEGER NOT NULL DEFAULT 0,
+            completion_tokens       INTEGER NOT NULL DEFAULT 0,
+            total_tokens            INTEGER NOT NULL DEFAULT 0,
             updated_at              TEXT    NOT NULL DEFAULT (datetime('now'))
         )
     """)
     conn.execute("INSERT OR IGNORE INTO stats_snapshot (id) VALUES (1)")
+    _migrate_stats_table(conn)
+
+
+def _migrate_stats_table(conn: sqlite3.Connection) -> None:
+    """Add token columns if missing from older schema."""
+    existing = conn.execute("PRAGMA table_info(stats_snapshot)").fetchall()
+    cols = {r[1] for r in existing}
+    for col in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE stats_snapshot ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
 
 
 def save_stats(stats: dict) -> None:
@@ -384,16 +397,22 @@ def save_stats(stats: dict) -> None:
             expensive_calls = ?,
             cheap_calls = ?,
             tool_calls_total = ?,
+            prompt_tokens = ?,
+            completion_tokens = ?,
+            total_tokens = ?,
             updated_at = datetime('now')
         WHERE id = 1
     """, (
-        stats["total_requests"],
-        stats["cache_hits"],
-        stats["cache_misses"],
-        stats["irrelevant_escalations"],
-        stats["expensive_calls"],
-        stats["cheap_calls"],
-        stats["tool_calls_total"],
+        stats.get("total_requests", 0),
+        stats.get("cache_hits", 0),
+        stats.get("cache_misses", 0),
+        stats.get("irrelevant_escalations", 0),
+        stats.get("expensive_calls", 0),
+        stats.get("cheap_calls", 0),
+        stats.get("tool_calls_total", 0),
+        stats.get("prompt_tokens", 0),
+        stats.get("completion_tokens", 0),
+        stats.get("total_tokens", 0),
     ))
     conn.commit()
 

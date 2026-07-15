@@ -14,6 +14,9 @@ _stats = {
     "expensive_calls": 0,
     "cheap_calls": 0,
     "tool_calls_total": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
     "models": {},
 }
 
@@ -29,12 +32,19 @@ def init_from_db() -> None:
     with _lock:
         for key in ("total_requests", "cache_hits", "cache_misses",
                      "irrelevant_escalations", "expensive_calls",
-                     "cheap_calls", "tool_calls_total"):
+                     "cheap_calls", "tool_calls_total",
+                     "prompt_tokens", "completion_tokens", "total_tokens"):
             if key in saved:
                 _stats[key] = saved[key]
 
 
-def record_request(hit: bool, model: str, tool_calls: int = 0) -> None:
+def record_request(
+    hit: bool,
+    model: str,
+    tool_calls: int = 0,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+) -> None:
     """Record a processed request. Persists every 10 requests."""
     global _save_count
     with _lock:
@@ -48,10 +58,12 @@ def record_request(hit: bool, model: str, tool_calls: int = 0) -> None:
         if model == "irrelevant-escalated":
             _stats["irrelevant_escalations"] += 1
         _stats["tool_calls_total"] += tool_calls
+        _stats["prompt_tokens"] += prompt_tokens
+        _stats["completion_tokens"] += completion_tokens
+        _stats["total_tokens"] += prompt_tokens + completion_tokens
         _stats["models"][model] = _stats["models"].get(model, 0) + 1
         _save_count += 1
 
-    # Persist every 10 requests to survive crashes between restarts
     if _save_count % 10 == 0:
         _flush_db()
 
@@ -86,5 +98,10 @@ def get_stats() -> dict:
             "irrelevant_escalations": irrelevant,
             "irrelevant_rate_pct": round(irrelevant / total * 100, 1) if total > 0 else 0,
             "tool_calls_total": _stats["tool_calls_total"],
+            "tokens": {
+                "prompt": _stats["prompt_tokens"],
+                "completion": _stats["completion_tokens"],
+                "total": _stats["total_tokens"],
+            },
             "models": _stats["models"],
         }

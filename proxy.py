@@ -15,6 +15,13 @@ from llm import (
 from stats import record_request
 
 
+def _record(hit: bool, model: str, usage: dict | None = None, tool_calls: int = 0):
+    pt = (usage or {}).get("prompt_tokens", 0)
+    ct = (usage or {}).get("completion_tokens", 0)
+    record_request(hit=hit, model=model, tool_calls=tool_calls,
+                   prompt_tokens=pt, completion_tokens=ct)
+
+
 CHEAP_MODEL_CONTEXT_PROMPT = """A similar question was previously answered by an expert AI.
 Here is that answer for reference:
 
@@ -104,7 +111,7 @@ async def handle_chat_completion(body: dict) -> dict:
             not result.get("tool_calls")
             and result.get("content", "").strip().upper().startswith("IRRELEVANT")
         ):
-            record_request(hit=False, model="irrelevant-escalated")
+            _record(hit=False, model="irrelevant-escalated")
             match = None
         else:
             response_content = result["content"]
@@ -112,7 +119,7 @@ async def handle_chat_completion(body: dict) -> dict:
             model_used = result.get("model", f"{CHEAP_MODEL} (cached)")
             usage = result.get("usage")
             finish_reason = result.get("finish_reason", "stop")
-            record_request(hit=True, model=model_used)
+            _record(hit=True, model=model_used, usage=usage)
 
     if not match:
         cache_aware = [
@@ -150,7 +157,7 @@ async def handle_chat_completion(body: dict) -> dict:
         finish_reason = result.get("finish_reason", "stop")
 
         insert_qa(match_query, response_content, model_used)
-        record_request(hit=False, model=model_used)
+        _record(hit=False, model=model_used, usage=usage)
 
     response = {
         "id": f"chatcmpl-{int(time.time())}",
@@ -233,7 +240,7 @@ async def stream_chat_completion(body: dict):
             not tool_calls
             and content.strip().upper().startswith("IRRELEVANT")
         ):
-            record_request(hit=False, model="irrelevant-escalated")
+            _record(hit=False, model="irrelevant-escalated")
             match = None
         else:
             # Stream buffered response
@@ -262,7 +269,7 @@ async def stream_chat_completion(body: dict):
                 })
 
             yield "data: [DONE]\n\n"
-            record_request(hit=True, model=model_used)
+            _record(hit=True, model=model_used, usage=usage)
             return
 
     # Cache miss (or IRRELEVANT escalated) — stream from expensive model
@@ -294,7 +301,7 @@ async def stream_chat_completion(body: dict):
 
         if full_text:
             insert_qa(match_query, full_text, model_used)
-        record_request(hit=False, model=model_used)
+        _record(hit=False, model=model_used, usage=usage)
 
     except Exception as e:
         error_chunk = {

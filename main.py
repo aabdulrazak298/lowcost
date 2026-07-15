@@ -10,11 +10,13 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 
 from db import init_db
 from proxy import handle_chat_completion, stream_chat_completion
 from webhook import handle_webhook_chat
-from config import AUTH_KEY, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW
+from config import AUTH_KEY, CHEAP_MODEL, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW
+from schemas import ChatCompletionRequest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -165,7 +167,7 @@ async def list_models(auth=Depends(auth_dependency)):
     return {
         "object": "list",
         "data": [
-            {"id": "lowcostllm", "object": "model"},
+            {"id": CHEAP_MODEL, "object": "model"},
         ],
     }
 
@@ -174,21 +176,29 @@ async def list_models(auth=Depends(auth_dependency)):
 async def chat_completions(request: Request, auth=Depends(auth_dependency)):
     try:
         body = await request.json()
-        if body.get("stream"):
+        req = ChatCompletionRequest.model_validate(body)
+        body_dict = req.model_dump(exclude_none=True)
+    except ValidationError as e:
+        return JSONResponse(
+            {"error": {"message": str(e.errors()[0]["msg"]), "type": "invalid_request"}},
+            status_code=422,
+        )
+    try:
+        if body_dict.get("stream"):
             return StreamingResponse(
-                stream_chat_completion(body),
+                stream_chat_completion(body_dict),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                 },
             )
-        if await _check_dedup(body):
+        if await _check_dedup(body_dict):
             return JSONResponse(
                 {"error": {"message": "Duplicate request", "type": "dedup"}},
                 status_code=409,
             )
-        result = await handle_chat_completion(body)
+        result = await handle_chat_completion(body_dict)
         return JSONResponse(result)
     except Exception as e:
         body_preview = {}

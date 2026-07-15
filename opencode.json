@@ -9,7 +9,7 @@
         "apiKey": "sk-lowcost-92c5efd0a86142a39aa132d8"
       },
       "models": {
-        "lowcostllm": {
+        "deepseek-v4-flash": {
           "name": "LowCostLLM (DeepSeek V4 Pro + Flash cache)"
         }
       }
