@@ -3,7 +3,7 @@ import json
 import time
 
 from config import CHEAP_MODEL
-from db import get_all_queries, insert_qa, search_candidates, hot_cache_lookup, hot_cache_put
+from db import cache_lookup, insert_qa
 from matcher import find_best_match
 from llm import (
     call_cheap,
@@ -65,41 +65,13 @@ def _extract_query_info(body: dict) -> tuple[str, str, list, float, int, list | 
     return user_query, match_query, messages, temperature, max_tokens, tools, expensive_max_tokens
 
 
-def _cache_lookup(match_query: str) -> dict | None:
-    """Find best cache match: hot cache → FTS5 search → RapidFuzz."""
-    # 1. Hot cache — exact match, instant
-    hot = hot_cache_lookup(match_query)
-    if hot:
-        return hot
-
-    # 2. FTS5 pre-filter — top 100 candidates by text relevance
-    candidates = search_candidates(match_query, limit=100)
-
-    # 3. RapidFuzz on filtered candidates
-    if candidates:
-        match = find_best_match(match_query, candidates)
-        if match:
-            hot_cache_put(match_query, match)
-            return match
-
-    # 4. Fallback: full scan (for sparse FTS5 results)
-    all_entries = get_all_queries()
-    if all_entries:
-        match = find_best_match(match_query, all_entries)
-        if match:
-            hot_cache_put(match_query, match)
-            return match
-
-    return None
-
-
 async def handle_chat_completion(body: dict) -> dict:
     """Process a /v1/chat/completions request (non-streaming)."""
     user_query, match_query, messages, temperature, max_tokens, tools, expensive_max_tokens = (
         _extract_query_info(body)
     )
 
-    match = _cache_lookup(match_query)
+    match = await cache_lookup(match_query)
     response_content = None
     response_tool_calls = None
     model_used = CHEAP_MODEL
@@ -237,7 +209,7 @@ async def stream_chat_completion(body: dict):
     chat_id = f"chatcmpl-{int(time.time())}"
     created = int(time.time())
 
-    match = _cache_lookup(match_query)
+    match = await cache_lookup(match_query)
 
     if match:
         # Cache hit — buffer cheap response, verify IRRELEVANT, then stream

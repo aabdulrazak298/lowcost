@@ -6,8 +6,7 @@ import datetime as _dt
 import asyncio
 import logging
 from config import CHEAP_MODEL
-from db import get_all_queries, insert_qa, increment_hit_count
-from matcher import find_best_match
+from db import cache_lookup, insert_qa, increment_hit_count
 from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images
 from stats import record_request
 
@@ -65,9 +64,7 @@ async def process_query(
     # Use last 3 user messages for matching; if only 1, use just the current query
     match_query = " ".join(user_lines[-3:])
 
-    # Check cache
-    cached = get_all_queries()
-    match = find_best_match(match_query, cached)
+    match = await cache_lookup(match_query)
 
     if match:
         # --- TRY CHEAP PATH ---
@@ -147,9 +144,7 @@ async def process_query_stream(
     user_lines.append(user_query)
     match_query = " ".join(user_lines[-3:])
 
-    # Check cache
-    cached = get_all_queries()
-    match = find_best_match(match_query, cached)
+    match = await cache_lookup(match_query)
 
     if match:
         context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(

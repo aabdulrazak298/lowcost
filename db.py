@@ -1,12 +1,14 @@
 """SQLite cache for Q&A pairs + conversation memory."""
+import asyncio
 import sqlite3
 import threading
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from config import CACHE_MAX_ENTRIES, CACHE_TTL_DAYS, DB_PATH
 
 _conn_local = threading.local()
-_hot_cache: dict[str, dict] = {}
-_hot_cache_lock = threading.Lock()
+_hot_cache: OrderedDict[str, dict] = OrderedDict()
+_hot_cache_lock = asyncio.Lock()
 HOT_CACHE_MAX = 2000
 
 
@@ -225,36 +227,62 @@ def get_cache_stats() -> dict:
     }
 
 
-# -- Hot cache -----------------------------------------------------
+# -- Hot cache (LRU via OrderedDict) --------------------------------
 
 def _hot_cache_put(key: str, entry: dict) -> None:
-    with _hot_cache_lock:
-        if len(_hot_cache) >= HOT_CACHE_MAX:
-            oldest = min(_hot_cache.keys(), key=lambda k: _hot_cache[k].get("hit_count", 0))
-            del _hot_cache[oldest]
-        _hot_cache[key] = entry
+    if len(_hot_cache) >= HOT_CACHE_MAX:
+        _hot_cache.popitem(last=False)  # evict least recently used
+    _hot_cache[key] = entry
 
 
 def _hot_cache_bump(cache_id: int) -> None:
-    with _hot_cache_lock:
-        for v in _hot_cache.values():
-            if v.get("id") == cache_id:
-                v["hit_count"] = v.get("hit_count", 0) + 1
-                break
+    for k in list(_hot_cache.keys()):
+        v = _hot_cache[k]
+        if v.get("id") == cache_id:
+            v["hit_count"] = v.get("hit_count", 0) + 1
+            _hot_cache.move_to_end(k)
+            break
 
 
-def hot_cache_lookup(query: str) -> dict | None:
-    """Exact match in hot cache for instant repeated queries."""
-    with _hot_cache_lock:
-        return _hot_cache.get(query)
+async def hot_cache_lookup(query: str) -> dict | None:
+    async with _hot_cache_lock:
+        entry = _hot_cache.get(query)
+        if entry:
+            _hot_cache.move_to_end(query)
+        return entry
 
 
-def hot_cache_put(query: str, entry: dict) -> None:
-    with _hot_cache_lock:
+async def hot_cache_put(query: str, entry: dict) -> None:
+    async with _hot_cache_lock:
         if len(_hot_cache) >= HOT_CACHE_MAX:
-            oldest = min(_hot_cache.keys(), key=lambda k: _hot_cache[k].get("hit_count", 0))
-            del _hot_cache[oldest]
+            _hot_cache.popitem(last=False)
         _hot_cache[query] = entry
+
+
+async def cache_lookup(match_query: str) -> dict | None:
+    """Unified cache lookup: hot cache → FTS5 → RapidFuzz → fallback full scan.
+    Used by both proxy.py and processor.py."""
+    from matcher import find_best_match
+
+    hot = await hot_cache_lookup(match_query)
+    if hot:
+        return hot
+
+    candidates = search_candidates(match_query, limit=100)
+    if candidates:
+        match = find_best_match(match_query, candidates)
+        if match:
+            await hot_cache_put(match_query, match)
+            return match
+
+    all_entries = get_all_queries()
+    if all_entries:
+        match = find_best_match(match_query, all_entries)
+        if match:
+            await hot_cache_put(match_query, match)
+            return match
+
+    return None
 
 
 # -- Conversation memory ------------------------------------------

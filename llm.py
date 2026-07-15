@@ -10,6 +10,10 @@ from config import (
     EXPENSIVE_BASE_URL,
     EXPENSIVE_MODEL,
     FALLBACK_MODEL,
+    FALLBACK_API_KEY,
+    FALLBACK_BASE_URL,
+    UPSTREAM_TIMEOUT,
+    UPSTREAM_MAX_RETRIES,
 )
 
 CHEAP_CHAT_URL = f"{CHEAP_BASE_URL}/chat/completions"
@@ -504,7 +508,7 @@ async def call_cheap(
 
     last_error = None
 
-    for attempt in range(3):
+    for attempt in range(UPSTREAM_MAX_RETRIES):
         if attempt > 0:
             _log.info(f"Retry {attempt + 1}/3 after: {last_error}")
             temp = temperature + (attempt * 0.15)  # bump temperature each retry
@@ -545,7 +549,7 @@ async def _call_cheap_once(
     conversation = list(messages)
     last_tool_calls = []
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         for _ in range(50):
             payload = {
                 "model": CHEAP_MODEL,
@@ -614,7 +618,7 @@ async def _call_expensive_primary(
 
     conversation = list(messages)
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         for _ in range(50):  # max 50 LLM calls — enough for deep research
             payload: dict = {
                 "model": EXPENSIVE_MODEL,
@@ -693,7 +697,7 @@ async def _call_expensive_stream_primary(
     conversation = list(messages)
     full_text = ""
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         for _ in range(20):
             payload: dict = {
                 "model": EXPENSIVE_MODEL,
@@ -765,7 +769,7 @@ async def _call_expensive_fallback(
 ) -> tuple[str, str]:
     """Fallback path: FALLBACK_MODEL via OpenRouter when primary is down."""
     headers = {
-        "Authorization": f"Bearer {CHEAP_API_KEY}",
+        "Authorization": f"Bearer {FALLBACK_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "http://localhost:8800",
         "X-Title": "LowCostLLM",
@@ -780,9 +784,9 @@ async def _call_expensive_fallback(
         "tool_choice": "auto",
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         resp = await client.post(
-            CHEAP_CHAT_URL, json=payload, headers=headers
+            f"{FALLBACK_BASE_URL}/chat/completions", json=payload, headers=headers
         )
         resp.raise_for_status()
         data = resp.json()
@@ -823,7 +827,7 @@ async def call_cheap_full(
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         resp = await client.post(CHEAP_CHAT_URL, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
@@ -870,7 +874,7 @@ async def call_expensive_full(
         payload["tool_choice"] = "auto"
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             resp = await client.post(
                 EXPENSIVE_CHAT_URL, json=payload, headers=headers
             )
@@ -889,7 +893,7 @@ async def call_expensive_full(
     except Exception:
         _logger.exception("Expensive model failed, falling back")
         fallback_headers = {
-            "Authorization": f"Bearer {CHEAP_API_KEY}",
+            "Authorization": f"Bearer {FALLBACK_API_KEY}",
             "Content-Type": "application/json",
             "HTTP-Referer": "http://localhost:8800",
             "X-Title": "LowCostLLM",
@@ -904,9 +908,9 @@ async def call_expensive_full(
             fb_payload["tools"] = tools
             fb_payload["tool_choice"] = "auto"
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             resp = await client.post(
-                CHEAP_CHAT_URL, json=fb_payload, headers=fallback_headers
+                f"{FALLBACK_BASE_URL}/chat/completions", json=fb_payload, headers=fallback_headers
             )
             resp.raise_for_status()
             data = resp.json()
@@ -949,7 +953,7 @@ async def stream_expensive_full(
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         async with client.stream(
             "POST", EXPENSIVE_CHAT_URL, json=payload, headers=headers
         ) as resp:
