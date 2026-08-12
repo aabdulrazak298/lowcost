@@ -229,7 +229,7 @@ def get_cache_stats() -> dict:
         "ttl_days": CACHE_TTL_DAYS,
         "max_entries": CACHE_MAX_ENTRIES,
         "hot_cache_size": len(_hot_cache),
-        "top_reused": [{"query": r["query"][:80], "hits": r["hit_count"]} for r in top],
+        "top_queries": [{"query": r["query"][:80], "count": r["hit_count"]} for r in top],
     }
 
 
@@ -260,27 +260,18 @@ async def hot_cache_put(query: str, entry: dict) -> None:
 
 
 async def cache_lookup(match_query: str) -> dict | None:
-    """Unified cache lookup: hot cache → FTS5 → RapidFuzz → fallback full scan.
-    Used by both proxy.py and processor.py."""
-    from matcher import find_best_match
+    """Unified cache lookup: hot cache → FTS5 → LLM smart match → fallback full scan.
+    Uses LLM-based semantic matching instead of RapidFuzz string distance."""
+    from matcher import smart_cache_lookup
 
     hot = await hot_cache_lookup(match_query)
     if hot:
         return hot
 
-    candidates = search_candidates(match_query, limit=100)
-    if candidates:
-        match = find_best_match(match_query, candidates)
-        if match:
-            await hot_cache_put(match_query, match)
-            return match
-
-    all_entries = get_all_queries()
-    if all_entries:
-        match = find_best_match(match_query, all_entries)
-        if match:
-            await hot_cache_put(match_query, match)
-            return match
+    match = await smart_cache_lookup(match_query)
+    if match:
+        await hot_cache_put(match_query, match)
+        return match
 
     return None
 

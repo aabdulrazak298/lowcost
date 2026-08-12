@@ -4,7 +4,6 @@ import time
 
 from config import CHEAP_MODEL
 from db import cache_lookup, insert_qa
-from matcher import find_best_match
 from llm import (
     call_cheap,
     call_expensive,
