@@ -9,6 +9,7 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from processor import process_query
+from llm import set_delivery_context, clear_delivery_context
 
 
 async def _stream_json_line(data: dict):
@@ -45,36 +46,80 @@ async def handle_webhook_chat(request: Request):
 
     start_ts = int(time.time() * 1000)
 
-    # Delegate to shared processor
-    answer, model_used, _images = await process_query(user_query, chat_history)
+    # Run processing in background with heartbeat to keep FlaskChat alive
+    import asyncio
+    result_answer = None
+    result_model = None
+    result_images = []
+    _exception = None
 
-    # Build the n8n-style stream
+    async def _process():
+        nonlocal result_answer, result_model, result_images, _exception
+        try:
+            set_delivery_context("web")
+            try:
+                answer, model_used, _images = await process_query(user_query, chat_history)
+            finally:
+                clear_delivery_context()
+            result_answer = answer
+            result_model = model_used
+            result_images = _images or []
+        except Exception as e:
+            _exception = e
+
+    process_task = asyncio.create_task(_process())
+
     async def stream():
         yield await _stream_json_line({
             "type": "begin",
             "metadata": {
                 "nodeName": "LowCostLLM",
-                "model": model_used,
                 "timestamp": start_ts,
             },
         })
 
-        # Split answer into chunks (~100 chars each for smooth streaming feel)
-        chunk_size = 100
-        for i in range(0, len(answer), chunk_size):
-            chunk = answer[i:i + chunk_size]
+        # Heartbeat loop — pulse every 10s
+        heartbeat = 0
+        while not process_task.done():
+            done, _ = await asyncio.wait([process_task], timeout=10)
+            if not done:
+                heartbeat += 1
+                yield await _stream_json_line({
+                    "type": "item",
+                    "content": "",
+                    "metadata": {},
+                })
+
+        if _exception:
             yield await _stream_json_line({
                 "type": "item",
-                "content": chunk,
+                "content": f"\n\nError: {str(_exception)[:200]}",
                 "metadata": {},
             })
-            if len(answer) > 300:
-                import asyncio
-                await asyncio.sleep(0.01)
+        else:
+            # Split answer into chunks (~100 chars for smooth streaming)
+            chunk_size = 100
+            for i in range(0, len(result_answer), chunk_size):
+                chunk = result_answer[i:i + chunk_size]
+                yield await _stream_json_line({
+                    "type": "item",
+                    "content": chunk,
+                    "metadata": {},
+                })
+                if len(result_answer) > 300:
+                    await asyncio.sleep(0.01)
+
+        # Embed generated images inline (markdown renders them in FlaskChat)
+        for url in result_images:
+            yield await _stream_json_line({
+                "type": "item",
+                "content": f"\n\n![Generated image]({url})\n",
+                "metadata": {},
+            })
 
         yield await _stream_json_line({
             "type": "end",
-            "metadata": {"timestamp": int(time.time() * 1000)},
+            "metadata": {"nodeName": "LowCostLLM", "error": str(_exception)[:200] if _exception else None, "timestamp": int(time.time() * 1000)},
         })
 
     return StreamingResponse(stream(), media_type="text/plain")

@@ -1,484 +1,345 @@
-"""Async LLM callers — cheap model (Qwen via OR) and expensive (DeepSeek V4 Pro direct + tools)."""
+"""LLM callers using OpenAI Agents SDK — provider-agnostic tool calling.
+
+Migrated from raw httpx to the Agents SDK. Handles retries, fallbacks,
+tool-calling loops, and provider routing automatically.
+"""
+
 import asyncio
 import json
+import logging
+import os
+import re
+import subprocess
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
 import httpx
+from openai import AsyncOpenAI
+from agents import Agent, Runner, function_tool, OpenAIChatCompletionsModel, set_tracing_disabled
+
 from config import (
     CHEAP_API_KEY,
     CHEAP_BASE_URL,
-    CHEAP_MODEL,
     EXPENSIVE_API_KEY,
     EXPENSIVE_BASE_URL,
-    EXPENSIVE_MODEL,
-    FALLBACK_MODEL,
-    FALLBACK_API_KEY,
-    FALLBACK_BASE_URL,
-    UPSTREAM_TIMEOUT,
-    UPSTREAM_MAX_RETRIES,
+    get_cheap_model,
+    get_expensive_model,
 )
+from stats import record_request
 
-CHEAP_CHAT_URL = f"{CHEAP_BASE_URL}/chat/completions"
-EXPENSIVE_CHAT_URL = f"{EXPENSIVE_BASE_URL}/chat/completions"
+# Disable SDK tracing to stop 401 spam on non-OpenAI providers
+set_tracing_disabled(True)
+
+logger = logging.getLogger("lowcostllm.llm")
+
+# ── Global usage tracker for real cost in footer ──────────────────
+
+_last_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "model": ""}
+
+
+def get_last_usage() -> dict:
+    return dict(_last_usage)
+
+
+def _reset_usage() -> None:
+    global _last_usage
+    _last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "model": ""}
+
+
+# ── Image delivery context ────────────────────────────────────────
+#
+# The image tools are generic — they don't know which platform/chat asked.
+# Each entry point binds a delivery target here before running a query so
+# generate_image / edit_image can self-deliver instead of returning a URL
+# that the LLM never relays:
+#   * telegram → photo is sent to the chat via sendPhoto (before the reply)
+#   * web/api  → URL is recorded in _generated_images and embedded inline
+
+import contextvars
+
+_delivery_ctx: contextvars.ContextVar = contextvars.ContextVar("delivery_ctx", default=None)
+
+
+def set_delivery_context(platform: str, chat_id: int | None = None, token: str | None = None) -> None:
+    """Bind the delivery target for the current request. platform: 'telegram' or 'web'."""
+    _delivery_ctx.set({"platform": platform, "chat_id": chat_id, "token": token})
+
+
+def clear_delivery_context() -> None:
+    _delivery_ctx.set(None)
+
+
+def _send_telegram_photo(chat_id: int, token: str, image_url: str) -> tuple[bool, str]:
+    """Send a photo by URL to a Telegram chat. Returns (ok, detail)."""
+    try:
+        payload = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "photo": image_url,
+        })
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            data=payload.encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+        if resp.get("ok"):
+            return True, ""
+        return False, str(resp)[:300]
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _deliver_generated_image(result: dict) -> str:
+    """Record a generated image and self-deliver it to the bound target."""
+    url = result["download_url"]
+    model = result.get("model", "unknown")
+    _generated_images.append(url)
+    ctx = _delivery_ctx.get()
+    if ctx and ctx.get("platform") == "telegram" and ctx.get("chat_id"):
+        ok, detail = _send_telegram_photo(ctx["chat_id"], ctx["token"], url)
+        if ok:
+            return f"Image generated and sent to the chat (model: {model})."
+        return f"Image generated but Telegram delivery failed ({detail}). URL: {url}"
+    return f"Image: {url}\nModel: {model}"
+
+
+# ── Tool implementations ──────────────────────────────────────────
+
 SEARXNG_URL = "http://127.0.0.1:8080/search?format=json"
 
-# ── Tool definitions ──────────────────────────────────────────────
 
-WEB_SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "search_web",
-        "description": (
-            "Search the web for current, up-to-date information. "
-            "Use when you need facts beyond your knowledge cutoff, "
-            "recent news, live data, or current events."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query — be specific.",
-                }
-            },
-            "required": ["query"],
-        },
-    },
-}
-
-TOOLS = [WEB_SEARCH_TOOL]
-
-# ── YouTube transcript tool ───────────────────────────────────────
-
-YOUTUBE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_youtube_transcript",
-        "description": (
-            "Fetch the full transcript of a YouTube video. "
-            "Use this when the user asks about a YouTube video's content, "
-            "wants a summary, or references a specific video. "
-            "Returns the transcript with timestamps and video metadata."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "video_url": {
-                    "type": "string",
-                    "description": (
-                        "YouTube video URL or ID. Supports: "
-                        "youtube.com/watch?v=ID, youtu.be/ID, youtube.com/shorts/ID, "
-                        "or bare video ID."
-                    ),
-                }
-            },
-            "required": ["video_url"],
-        },
-    },
-}
-
-CODE_EXEC_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "run_code",
-        "description": (
-            "Execute Python code in a secure sandbox. Use for calculations, "
-            "data analysis, unit conversions, or quick math. "
-            "The output of the last expression is returned."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Python code to execute."}
-            },
-            "required": ["code"],
-        },
-    },
-}
-
-IMAGE_GEN_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "generate_image",
-        "description": "Generate an AI image from a text description.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string", "description": "Image description."}
-            },
-            "required": ["prompt"],
-        },
-    },
-}
-
-PLOT_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "generate_plot",
-        "description": (
-            "Generate a chart or graph using matplotlib. Provide Python code that "
-            "creates a plot using matplotlib — the output image will be sent to the user. "
-            "Use `import matplotlib.pyplot as plt` and call `plt.savefig('/tmp/plot.png')` "
-            "then print 'DONE'."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Python code using matplotlib to generate a chart."}
-            },
-            "required": ["code"],
-        },
-    },
-}
-
-IMAGE_ANALYZE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "analyze_image",
-        "description": "Analyze or describe an image from a URL.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "image_url": {"type": "string", "description": "Image URL."},
-                "question": {
-                    "type": "string",
-                    "description": "What to ask about the image.",
-                },
-            },
-            "required": ["image_url"],
-        },
-    },
-}
-
-FETCH_PAGE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "fetch_webpage",
-        "description": (
-            "Fetch and read the full text content of a webpage. "
-            "Use when the user asks you to read, summarize, or extract "
-            "information from a specific URL or website."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Full URL of the webpage to fetch (e.g. https://example.com/page).",
-                }
-            },
-            "required": ["url"],
-        },
-    },
-}
-
-ALL_TOOLS = [
-    WEB_SEARCH_TOOL,
-    YOUTUBE_TOOL,
-    CODE_EXEC_TOOL,
-    IMAGE_GEN_TOOL,
-    PLOT_TOOL,
-    IMAGE_ANALYZE_TOOL,
-    FETCH_PAGE_TOOL,
-]
-
-
-# ── n8n API config ────────────────────────────────────────────────
-
-N8N_BASE = "http://127.0.0.1:8000"
-N8N_KEY = "987654321"
-
-
-YOUTUBE_VPS_URL = "http://141.11.17.227:8000/api/youtube/script"
-YOUTUBE_VPS_KEY = "987654321"
-
-
-def _is_openrouter(url: str) -> bool:
-    return "openrouter.ai" in url
-
-
-# ── Web search ────────────────────────────────────────────────────
-
-
-async def _search_web(query: str, max_results: int = 5) -> str:
-    """Execute web search via local SearXNG."""
+@function_tool
+def web_search(query: str) -> str:
+    """Search the web using SearXNG. Returns title, snippet, and URL for each result."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                SEARXNG_URL, params={"q": query, "format": "json"}
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        results = data.get("results", [])[:max_results]
-        if not results:
-            return "No results for: " + query
-
-        lines = []
-        for i, r in enumerate(results, 1):
-            title = r.get("title", "Untitled")
-            url = r.get("url", "")
-            snippet = r.get("content", "")[:300]
-            lines.append(f"{i}. {title}\n   URL: {url}\n   {snippet}")
-
-        return "\n\n".join(lines)
+        url = f"{SEARXNG_URL}&q={urllib.parse.quote(query)}"
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "LowCostLLM/0.5"}),
+            timeout=10,
+        ) as r:
+            data = json.loads(r.read())
     except Exception as e:
-        return f"Search error: {e}"
+        return f"Search unavailable: {e}"
+
+    results = data.get("results", [])
+    if not results:
+        return "No results found."
+
+    return "\n\n".join(
+        f"{i+1}. {r.get('title', '?')}\n   {r.get('content', '')[:300]}\n   {r.get('url', '')}"
+        for i, r in enumerate(results[:8])
+    )
 
 
-async def _execute_tool(tool_call: dict) -> dict:
-    """Execute a tool call, return result message dict."""
-    fn_name = tool_call["function"]["name"]
-    fn_args = json.loads(tool_call["function"]["arguments"])
-
-    if fn_name == "search_web":
-        content = await _search_web(fn_args.get("query", ""))
-    elif fn_name == "get_youtube_transcript":
-        content = await _fetch_youtube_transcript(fn_args.get("video_url", ""))
-    elif fn_name == "run_code":
-        content = await _run_code(fn_args.get("code", ""))
-    elif fn_name == "generate_image":
-        content = await _generate_image(fn_args.get("prompt", ""))
-    elif fn_name == "generate_plot":
-        content = await _generate_plot(fn_args.get("code", ""))
-    elif fn_name == "analyze_image":
-        content = await _analyze_image(
-            fn_args.get("image_url", ""),
-            fn_args.get("question", "Describe this image"),
+@function_tool
+def web_fetch(url: str) -> str:
+    """Fetch and extract text content from a web page URL."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 LowCostLLM/0.5"},
         )
-    elif fn_name == "fetch_webpage":
-        content = await _fetch_webpage(fn_args.get("url", ""))
-    else:
-        content = f"Unknown tool: {fn_name}"
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"Fetch failed: {e}"
 
-    return {"role": "tool", "tool_call_id": tool_call["id"], "content": content}
+    # Strip scripts, styles, HTML tags
+    text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:8000]
 
 
-# ── n8n API tool implementations ──────────────────────────────────
+ALL_TOOLS = [web_search, web_fetch]
 
 
-async def _n8n_post(endpoint: str, body: dict) -> dict:
-    """Call n8n API endpoint with auth."""
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            f"{N8N_BASE}{endpoint}",
-            json=body,
+@function_tool
+def youtube_transcript(video_url: str) -> str:
+    """Get the transcript of a YouTube video. Use when user asks about YouTube content."""
+    try:
+        req = urllib.request.Request(
+            "http://141.11.17.227:8000/api/youtube/script",
+            data=json.dumps({"video_url_or_id": video_url}).encode(),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {N8N_KEY}",
+                "X-API-Key": "987654321",
             },
         )
-        resp.raise_for_status()
-        return resp.json()
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        return f"YouTube transcript unavailable: {e}"
+
+    if not data.get("transcript_available"):
+        title = data.get("metadata", {}).get("title", "Unknown")
+        return f"No transcript available for: {title}"
+
+    meta = data.get("metadata", {})
+    transcript = data.get("transcript", [])
+
+    lines = [
+        f"Title: {meta.get('title', 'Unknown')}",
+        f"Duration: {int(meta.get('duration', 0)) // 60} min",
+        f"Video ID: {data.get('video_id', '?')}",
+        "=" * 60,
+    ]
+
+    for seg in transcript[:200]:  # cap at 200 segments to avoid token overflow
+        s = int(seg["start"])
+        ts = f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+        lines.append(f"[{ts}] {seg['text']}")
+
+    return "\n".join(lines)
 
 
-async def _run_code(code: str) -> str:
-    """Execute Python code via n8n sandbox."""
+# ── Additional tools (matching ThinkLLM executor) ─────────────────
+
+
+@function_tool
+def run_code(code: str) -> str:
+    """Execute Python code in a sandbox. Use for calculations, data processing, or logic."""
     try:
-        result = await _n8n_post("/code/execute", {
-            "code": code,
-            "language": "python",
-        })
-        if not result.get("success", True):
-            err = result.get("error_message") or result.get("stderr", "")
-            return f"Code error: {err}"
-
-        stdout = result.get("stdout", "").strip()
-        value = result.get("result")
-        if value is not None:
-            return str(value)
-        if stdout:
-            return stdout.split("\n")[-1] if "\n" in stdout else stdout
-        return "(code executed, no output)"
+        req = urllib.request.Request(
+            "http://localhost:8000/code/execute",
+            data=json.dumps({"code": code, "timeout": 30}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer 987654321"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=35) as r:
+            result = json.loads(r.read())
+        if result.get("error"):
+            return f"Error: {result['error']}"
+        return str(result.get("stdout") or result.get("output") or result.get("result") or "(no output)")[:4000]
     except Exception as e:
         return f"Code execution failed: {e}"
 
 
-async def _generate_plot(code: str) -> str:
-    """Execute matplotlib code and capture the plot output."""
-    import subprocess, tempfile, uuid
-    from pathlib import Path
-
-    # Ensure matplotlib is available
-    wrapped = (
-        "import matplotlib\nmatplotlib.use('Agg')\n"
-        "import matplotlib.pyplot as plt\n"
-        + code +
-        "\nif plt.get_fignums():\n    plt.savefig('/tmp/plot.png')\n"
-    )
+@function_tool
+def generate_graph(x: list, y: list, chart_type: str = "line", title: str = "") -> str:
+    """Generate a chart/graph from data. chart_type: line, bar, scatter, pie."""
     try:
-        result = subprocess.run(
-            ["python3", "-c", wrapped],
-            capture_output=True, text=True, timeout=30,
+        import base64
+        payload = {"data": {"x": x, "y": y}, "graph_type": chart_type}
+        if title:
+            payload["data"]["title"] = title
+        req = urllib.request.Request(
+            "http://localhost:8000/code/generate_graph",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer 987654321"},
+            method="POST",
         )
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-
-        plot_path = Path("/tmp/plot.png")
-        if plot_path.exists():
-            img_dir = Path(__file__).parent / "generated"
-            img_dir.mkdir(exist_ok=True)
-            fname = f"plot_{uuid.uuid4().hex[:8]}.png"
-            fpath = img_dir / fname
-            import shutil
-            shutil.move(str(plot_path), str(fpath))
-            _generated_images.append(str(fpath))
-            return f"Plot generated: {fname}" + (f"\nOutput: {stdout}" if stdout else "")
-        else:
-            return f"No plot produced.\nOutput: {stdout}\nErrors: {stderr}" if stdout or stderr else "No plot produced."
-    except Exception as e:
-        return f"Plot generation failed: {e}"
-
-
-# Track images generated during this request so Telegram can send them
-_generated_images: list[str] = []
-_image_tasks: list = []  # pending async generation tasks
-
-
-def _clear_generated_images() -> None:
-    _generated_images.clear()
-    _image_tasks.clear()
-
-
-def _get_generated_images() -> list[str]:
-    return list(_generated_images)
-
-
-async def _wait_for_images() -> list[str]:
-    """Wait for any pending image generation tasks to complete."""
-    if _image_tasks:
-        await asyncio.gather(*_image_tasks)
-    return list(_generated_images)
-
-
-async def _generate_image(prompt: str) -> str:
-    """Generate image via OpenRouter (fire-and-forget, adds to _generated_images)."""
-    import base64, uuid
-    from pathlib import Path
-
-    async def _do_generate():
-        try:
-            headers = {
-                "Authorization": f"Bearer {CHEAP_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "http://localhost:8800",
-                "X-Title": "LowCostLLM",
-            }
-            payload = {"model": "google/gemini-2.5-flash-image", "prompt": prompt, "n": 1}
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    "https://openrouter.ai/api/v1/images/generations",
-                    json=payload, headers=headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-
-            item = data.get("data", [{}])[0]
-            b64 = item.get("b64_json", "")
-            if b64:
-                img_dir = Path(__file__).parent / "generated"
-                img_dir.mkdir(exist_ok=True)
-                fname = f"{uuid.uuid4().hex[:8]}.png"
-                fpath = img_dir / fname
-                fpath.write_bytes(base64.b64decode(b64))
-                _generated_images.append(str(fpath))
-        except Exception:
-            pass  # failure is silent — LLM already moved on
-
-    # Fire and forget
-    task = asyncio.create_task(_do_generate())
-    _image_tasks.append(task)
-
-    return f"Image generation started for: {prompt[:80]}"
-
-
-async def _analyze_image(image_url: str, question: str) -> str:
-    """Analyze image via n8n vision model."""
-    try:
-        result = await _n8n_post("/image/analyze", {
-            "image_url": image_url,
-            "question": question,
-        })
-        return result.get("analysis", result.get("response", str(result)))
-    except Exception as e:
-        return f"Image analysis failed: {e}"
-
-
-# ── Webpage fetch via n8n ─────────────────────────────────────────
-
-
-async def _fetch_webpage(url: str) -> str:
-    """Fetch webpage text content via n8n text/load API."""
-    try:
-        # Step 1: Load the URL
-        load_result = await _n8n_post("/text/load", {"url": url})
-        file_id = load_result.get("file_id")
-        if not file_id:
-            return f"Failed to load page: {load_result}"
-
-        # Step 2: Get chunk 0 (first chunk, up to ~50K chars)
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(
-                f"{N8N_BASE}/text/{file_id}/chunk/0",
-                headers={"Authorization": f"Bearer {N8N_KEY}"},
+        with urllib.request.urlopen(req, timeout=20) as r:
+            result = json.loads(r.read())
+        if result.get("image"):
+            b64_data = result["image"].split(",", 1)[-1] if "," in result["image"] else result["image"]
+            img_data = base64.b64decode(b64_data)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                f.write(img_data)
+                tmp_path = f.name
+            p = subprocess.run(
+                ["curl", "-s", "http://localhost:8000/upload/file",
+                 "-H", "Authorization: Bearer 987654321",
+                 "-F", f"file=@{tmp_path}"],
+                capture_output=True, text=True, timeout=20,
             )
-            resp.raise_for_status()
-            chunk = resp.json()
-
-        text = chunk.get("content", chunk.get("text", str(chunk)))
-        # Truncate to reasonable size for the model
-        if len(text) > 8000:
-            text = text[:8000] + "\n\n... (truncated, page is longer)"
-        return text
-
+            Path(tmp_path).unlink(missing_ok=True)
+            try:
+                up_result = json.loads(p.stdout)
+                if up_result.get("download_url"):
+                    return f"Graph: {up_result['download_url']}"
+            except json.JSONDecodeError:
+                pass
+            return f"Upload failed: {p.stdout[:200]}"
+        return f"Graph generation failed: {str(result)[:500]}"
     except Exception as e:
-        return f"Failed to fetch webpage: {e}"
+        return f"Graph failed: {e}"
 
 
-# ── YouTube transcript fetch ──────────────────────────────────────
-
-
-async def _fetch_youtube_transcript(video_url: str) -> str:
-    """Fetch transcript from YouTube via the second VPS."""
+@function_tool
+def generate_image(prompt: str) -> str:
+    """Generate an AI image from a text prompt. Returns a download URL."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                YOUTUBE_VPS_URL,
-                json={"video_url_or_id": video_url},
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-Key": YOUTUBE_VPS_KEY,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        if not data.get("transcript_available"):
-            return (
-                f"No transcript available for this video.\n"
-                f"Title: {data.get('metadata', {}).get('title', 'Unknown')}"
-            )
-
-        meta = data.get("metadata", {})
-        segments = data.get("transcript", [])
-
-        lines = [
-            f"Title: {meta.get('title', 'Unknown')}",
-            f"Duration: {int(meta.get('duration', 0)) // 60} min",
-            f"Segments: {len(segments)}",
-            "",
-        ]
-
-        for seg in segments:
-            s = int(seg["start"])
-            ts = f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-            lines.append(f"[{ts}] {seg['text']}")
-
-        return "\n".join(lines)
-
+        api_key = os.environ.get("CHEAP_API_KEY", "")
+        req = urllib.request.Request(
+            "http://127.0.0.1:8000/image/generate",
+            data=json.dumps({
+                "api_key": api_key,
+                "model": "qwen/qwen-image-3",
+                "content": prompt,
+            }).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer 987654321"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            result = json.loads(r.read())
+        if result.get("download_url"):
+            return _deliver_generated_image(result)
+        return f"Image generation failed: {result}"
     except Exception as e:
-        return f"YouTube transcript fetch error: {e}"
+        return f"Image failed: {e}"
 
 
-# ── LLM callers ───────────────────────────────────────────────────
+@function_tool
+def edit_image(image_url: str, prompt: str) -> str:
+    """Edit an existing image using AI. Provide the image URL and edit instructions."""
+    try:
+        api_key = os.environ.get("CHEAP_API_KEY", "")
+        req = urllib.request.Request(
+            "http://127.0.0.1:8000/image/edit",
+            data=json.dumps({
+                "api_key": api_key,
+                "model": "qwen/qwen-image-3",
+                "prompt": prompt,
+                "image_url": image_url,
+            }).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer 987654321"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            result = json.loads(r.read())
+        if result.get("download_url"):
+            return _deliver_generated_image(result)
+        return f"Image edit failed: {result}"
+    except Exception as e:
+        return f"Image edit failed: {e}"
+
+
+ALL_TOOLS = [web_search, web_fetch, youtube_transcript, run_code, generate_graph, generate_image, edit_image]
+
+
+# ── Client factories ──────────────────────────────────────────────
+
+
+def _build_cheap_client() -> AsyncOpenAI:
+    """OpenRouter client for cheap model."""
+    return AsyncOpenAI(
+        base_url=CHEAP_BASE_URL,
+        api_key=CHEAP_API_KEY,
+        max_retries=1, timeout=httpx.Timeout(connect=5.0, read=180.0, write=120.0, pool=5.0),
+        default_headers={
+            "HTTP-Referer": "http://localhost:8800",
+            "X-Title": "LowCostLLM",
+        },
+    )
+
+
+def _build_expensive_client() -> AsyncOpenAI:
+    """Direct API client for expensive model (with OpenRouter fallback)."""
+    return AsyncOpenAI(
+        base_url=EXPENSIVE_BASE_URL,
+        api_key=EXPENSIVE_API_KEY,
+        max_retries=1, timeout=httpx.Timeout(connect=5.0, read=180.0, write=120.0, pool=5.0),
+    )
+
+
+# ── Agent wrappers ────────────────────────────────────────────────
 
 
 async def call_cheap(
@@ -487,105 +348,78 @@ async def call_cheap(
     max_tokens: int = 8192,
     tools: list | None = None,
 ) -> str:
-    """Call the cheap model with optional tool calling. Retries on known errors.
+    """Call cheap model via OpenRouter with optional tool calling.
 
-    Supports web search tool so cached answers can be augmented with
-    fresh information when the similar query needs it.
+    Uses OpenAI Agents SDK — provider routing handled automatically.
     """
-    import logging
-    _log = logging.getLogger(__name__)
+    client = _build_cheap_client()
+    model_id = get_cheap_model()
 
-    headers = {
-        "Authorization": f"Bearer {CHEAP_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    if _is_openrouter(CHEAP_BASE_URL):
-        headers["HTTP-Referer"] = "http://localhost:8800"
-        headers["X-Title"] = "LowCostLLM"
+    # Build the SDK model
+    sdk_model = OpenAIChatCompletionsModel(
+        model=model_id,
+        openai_client=client,
+    )
 
-    # None = ALL_TOOLS, [] = no tools
-    use_tools = ALL_TOOLS if tools is None else tools
+    use_tools = ALL_TOOLS if tools is None else (tools or [])
 
-    last_error = None
-
-    for attempt in range(UPSTREAM_MAX_RETRIES):
-        if attempt > 0:
-            _log.info(f"Retry {attempt + 1}/3 after: {last_error}")
-            temp = temperature + (attempt * 0.15)  # bump temperature each retry
+    # Extract system + user messages for the Agent
+    # If no explicit system message, use the first user message as instructions
+    # (critical for cache reformulation: the context prompt needs to guide behavior)
+    system_prompt = ""
+    user_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_prompt += m["content"] + "\n"
         else:
-            temp = temperature
+            user_messages.append(m)
 
-        try:
-            result = await _call_cheap_once(
-                messages, temp, max_tokens, use_tools, headers
-            )
-            # If result is a string (error signal), it means we should retry
-            if result == "__LOOP__":
-                last_error = "tool loop"
-                use_tools = []  # disable tools on retry after loop
-                continue
-            if result == "__MAX_ROUNDS__":
-                last_error = "max rounds"
-                continue  # retry with higher temperature
-            return result
-        except Exception as e:
-            last_error = str(e)[:80]
-            _log.warning(f"Attempt {attempt + 1} failed: {last_error}")
-            if attempt < 2:
-                continue
-            raise  # all 3 attempts failed
+    # When the only "user" message is actually a context prompt (cache reformulation),
+    # use it as instructions and construct a clean user input
+    if not system_prompt and len(user_messages) == 1:
+        content = user_messages[0]["content"]
+        if "IMPORTANT — RELEVANCE CHECK" in content or "FOUNDATION to build on" in content:
+            # Split: instructions from the context prompt, user query from the last line
+            lines = content.split("\n")
+            instructions = content
+            # Extract User's question line for cleaner input
+            user_query_line = ""
+            for i, line in enumerate(lines):
+                if line.startswith("User's question:"):
+                    user_query_line = line.replace("User's question:", "").strip()
+                    break
+            system_prompt = instructions
+            user_messages = [{"role": "user", "content": user_query_line or user_messages[0]["content"]}]
 
-    return "(all retries exhausted — giving up)"
+    agent = Agent(
+        name="LowCostLLM-Cheap",
+        instructions=system_prompt.strip() or "You are a helpful assistant. Use web_search to find current information whenever needed.",
+        tools=use_tools,
+        model=sdk_model,
+    )
 
+    try:
+        # Convert messages to input string
+        input_text = "\n".join(
+            f"{m['role']}: {m['content']}" for m in user_messages[-5:]
+        )
 
-async def _call_cheap_once(
-    messages: list[dict],
-    temperature: float,
-    max_tokens: int,
-    use_tools: list | None,
-    headers: dict,
-) -> str:
-    """Single call to cheap model — returns str or error signal."""
-    conversation = list(messages)
-    last_tool_calls = []
+        result = await Runner.run(agent, input=input_text, max_turns=30)
 
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-        for _ in range(50):
-            payload = {
-                "model": CHEAP_MODEL,
-                "messages": conversation,
-                "temperature": temperature,
-                "max_tokens": max_tokens or 8192,
+        # Track usage
+        if result and hasattr(result, "usage"):
+            global _last_usage
+            _last_usage = {
+                "prompt_tokens": getattr(result.usage, "input_tokens", 0),
+                "completion_tokens": getattr(result.usage, "output_tokens", 0),
+                "model": model_id,
             }
-            if use_tools:
-                payload["tools"] = use_tools
-                payload["tool_choice"] = "auto"
 
-            resp = await client.post(CHEAP_CHAT_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            choice = data["choices"][0]
-            msg = choice["message"]
-            finish = choice.get("finish_reason", "")
+        return result.final_output if result else "(no response)"
 
-            if msg.get("tool_calls") and finish in ("tool_calls", "length"):
-                tc_sigs = [(tc["function"]["name"], tc["function"]["arguments"]) for tc in msg["tool_calls"]]
-                if tc_sigs == last_tool_calls:
-                    return "__LOOP__"  # signal to retry
-                last_tool_calls = tc_sigs
-                conversation.append({
-                    "role": "assistant",
-                    "content": msg.get("content"),
-                    "tool_calls": msg["tool_calls"],
-                })
-                for tc in msg["tool_calls"]:
-                    result = await _execute_tool(tc)
-                    conversation.append(result)
-                continue
-
-            return msg.get("content", "") or msg.get("reasoning_content", "") or "(no response)"
-
-        return "__MAX_ROUNDS__"
+    except Exception as e:
+        logger.warning(f"Cheap model failed: {e}")
+        return f"(error: {e})"
 
 
 async def call_expensive(
@@ -593,67 +427,85 @@ async def call_expensive(
     temperature: float = 0.7,
     max_tokens: int = 8192,
 ) -> tuple[str, str]:
-    """Call DeepSeek V4 Pro with native tool calling. Falls back to Qwen Flash
-    via OpenRouter on API failure (circuit breaker).
+    """Call expensive model with tools. Falls back to OpenRouter on failure.
 
     Returns (response_text, model_used).
     """
+    model_id = get_expensive_model()
+
+    # OpenRouter-format IDs (org/model) route straight to OpenRouter — the
+    # DeepSeek direct API only recognizes native IDs (deepseek-v4-pro, etc.)
+    # and rejects "upstage/solar-pro4" with a wasted round-trip. (Restores the
+    # auto-detect from before the SDK migration — see skill pitfall 50.)
+    is_or = "/" in model_id
+
+    if is_or:
+        text = await _call_expensive_with_client(
+            messages, temperature, max_tokens, _build_cheap_client(), model_id
+        )
+        return text, model_id
+
+    # Native DeepSeek ID: try direct first, fall back to OpenRouter on failure
     try:
-        return await _call_expensive_primary(messages, temperature, max_tokens)
-    except Exception:
-        # Circuit breaker — fall back to model via OpenRouter
-        return await _call_expensive_fallback(messages, temperature, max_tokens)
+        text = await _call_expensive_with_client(
+            messages, temperature, max_tokens, _build_expensive_client(), model_id
+        )
+        return text, model_id
+    except Exception as e:
+        logger.warning(f"Expensive direct failed ({e}), falling back to OpenRouter")
+
+    # Fallback: OpenRouter
+    fallback_client = _build_cheap_client()
+    text = await _call_expensive_with_client(
+        messages, temperature, max_tokens, fallback_client, model_id
+    )
+    return text, f"{model_id} (fallback)"
 
 
-async def _call_expensive_primary(
+async def _call_expensive_with_client(
     messages: list[dict],
-    temperature: float = 0.7,
-    max_tokens: int = 2048,
-) -> tuple[str, str]:
-    """Primary path: DeepSeek V4 Pro direct API."""
-    headers = {
-        "Authorization": f"Bearer {EXPENSIVE_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    temperature: float,
+    max_tokens: int,
+    client: AsyncOpenAI,
+    model_id: str,
+) -> str:
+    """Internal: call expensive model through the given client."""
+    sdk_model = OpenAIChatCompletionsModel(
+        model=model_id,
+        openai_client=client,
+    )
 
-    conversation = list(messages)
+    system_prompt = ""
+    user_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_prompt += m["content"] + "\n"
+        else:
+            user_messages.append(m)
 
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-        for _ in range(50):  # max 50 LLM calls — enough for deep research
-            payload: dict = {
-                "model": EXPENSIVE_MODEL,
-                "messages": conversation,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "tools": ALL_TOOLS,
-                "tool_choice": "auto",
-            }
+    agent = Agent(
+        name="LowCostLLM-Expensive",
+        instructions=system_prompt.strip() or "You are a helpful assistant with web search and browsing tools.",
+        tools=ALL_TOOLS,
+        model=sdk_model,
+    )
 
-            resp = await client.post(
-                EXPENSIVE_CHAT_URL, json=payload, headers=headers
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            choice = data["choices"][0]
-            msg = choice["message"]
-            finish = choice.get("finish_reason", "")
+    input_text = "\n".join(
+        f"{m['role']}: {m['content']}" for m in user_messages[-10:]
+    )
 
-            if msg.get("tool_calls") and finish in ("tool_calls", "length"):
-                conversation.append({
-                    "role": "assistant",
-                    "content": msg.get("content"),
-                    "tool_calls": msg["tool_calls"],
-                })
-                for tc in msg["tool_calls"]:
-                    result = await _execute_tool(tc)
-                    conversation.append(result)
-                continue
+    result = await Runner.run(agent, input=input_text, max_turns=30)
 
-            text = msg.get("content", "") or msg.get("reasoning_content", "") or "(no response)"
-            model = data.get("model", EXPENSIVE_MODEL)
-            return text, model
+    # Track usage
+    if result and hasattr(result, "usage"):
+        global _last_usage
+        _last_usage = {
+            "prompt_tokens": getattr(result.usage, "input_tokens", 0),
+            "completion_tokens": getattr(result.usage, "output_tokens", 0),
+            "model": model_id,
+        }
 
-        return "(tool calling exceeded max rounds)", EXPENSIVE_MODEL
+    return result.final_output if result else "(no response)"
 
 
 async def call_expensive_stream(
@@ -662,140 +514,48 @@ async def call_expensive_stream(
     temperature: float = 0.7,
     max_tokens: int = 8192,
 ) -> tuple[str, str]:
-    """Stream DeepSeek V4 Pro response, calling callback(chunk_text) for each chunk.
-
-    Returns (full_text, model_used) when complete.
-    Falls back to non-streaming if streaming fails.
-    """
-    import logging
-    _logger = logging.getLogger(__name__)
-    try:
-        return await _call_expensive_stream_primary(messages, callback, temperature, max_tokens)
-    except Exception as e:
-        _logger.exception(f"Stream failed, falling back: {e}")
-        # Fall back to non-streaming
-        text, model = await _call_expensive_primary(messages, temperature, max_tokens)
-        if asyncio.iscoroutinefunction(callback):
-            await callback(text)
-        else:
-            callback(text)
-        return text, model
+    """Streaming variant — falls back to non-streaming for now."""
+    text, model = await call_expensive(messages, temperature, max_tokens)
+    if asyncio.iscoroutinefunction(callback):
+        await callback(text)
+    else:
+        callback(text)
+    return text, model
 
 
-async def _call_expensive_stream_primary(
-    messages: list[dict],
-    callback,
-    temperature: float = 0.7,
-    max_tokens: int = 2048,
-) -> tuple[str, str]:
-    """Stream from DeepSeek V4 Pro with tool calling support."""
-    headers = {
-        "Authorization": f"Bearer {EXPENSIVE_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    conversation = list(messages)
-    full_text = ""
-
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-        for _ in range(20):
-            payload: dict = {
-                "model": EXPENSIVE_MODEL,
-                "messages": conversation,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "tools": ALL_TOOLS,
-                "tool_choice": "auto",
-                "stream": True,
-            }
-
-            tool_calls = []
-            current_tool = None
-
-            async with client.stream("POST", EXPENSIVE_CHAT_URL, json=payload, headers=headers) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                    except Exception:
-                        continue
-                    delta = data["choices"][0].get("delta", {})
-                    if "tool_calls" in delta:
-                        for tc in delta["tool_calls"]:
-                            idx = tc.get("index", 0)
-                            while len(tool_calls) <= idx:
-                                tool_calls.append({"id": "", "function": {"name": "", "arguments": ""}})
-                            if "id" in tc:
-                                tool_calls[idx]["id"] = tc["id"]
-                            if "function" in tc:
-                                if "name" in tc["function"]:
-                                    tool_calls[idx]["function"]["name"] = tc["function"]["name"]
-                                if "arguments" in tc["function"]:
-                                    tool_calls[idx]["function"]["arguments"] += tc["function"]["arguments"]
-                    content = delta.get("content", "") or ""
-                    if content:
-                        full_text += content
-                        if asyncio.iscoroutinefunction(callback):
-                            await callback(content)
-                        else:
-                            callback(content)
-
-            if tool_calls:
-                conversation.append({
-                    "role": "assistant",
-                    "content": full_text or None,
-                    "tool_calls": tool_calls,
-                })
-                for tc in tool_calls:
-                    result = await _execute_tool(tc)
-                    conversation.append(result)
-                full_text = ""
-                continue
-
-            return full_text, EXPENSIVE_MODEL
-
-        return "(tool calling exceeded max rounds)", EXPENSIVE_MODEL
+# ── OpenCode-compatible wrappers ──────────────────────────────────
 
 
-async def _call_expensive_fallback(
+async def call_expensive_full(
     messages: list[dict],
     temperature: float = 0.7,
-    max_tokens: int = 2048,
-) -> tuple[str, str]:
-    """Fallback path: FALLBACK_MODEL via OpenRouter when primary is down."""
-    headers = {
-        "Authorization": f"Bearer {FALLBACK_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:8800",
-        "X-Title": "LowCostLLM",
+    max_tokens: int = 8192,
+) -> dict:
+    """Call expensive model — returns full response dict for proxy compatibility."""
+    text, model = await call_expensive(messages, temperature, max_tokens)
+    return {
+        "content": text,
+        "tool_calls": None,
+        "model": model,
+        "usage": get_last_usage(),
+        "finish_reason": "stop",
     }
 
-    payload = {
-        "model": FALLBACK_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "tools": ALL_TOOLS,
-        "tool_choice": "auto",
+
+async def stream_expensive_full(
+    messages: list[dict],
+    temperature: float = 0.7,
+    max_tokens: int = 8192,
+) -> dict:
+    """Streaming wrapper — returns same dict format for proxy compatibility."""
+    text, model = await call_expensive(messages, temperature, max_tokens)
+    return {
+        "content": text,
+        "tool_calls": None,
+        "model": model,
+        "usage": get_last_usage(),
+        "finish_reason": "stop",
     }
-
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-        resp = await client.post(
-            f"{FALLBACK_BASE_URL}/chat/completions", json=payload, headers=headers
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data["choices"][0]["message"]["content"]
-        model = f"{FALLBACK_MODEL} (fallback)"
-        return text, model
-
-
-# === OpenCode-compatible full-response functions ===
 
 
 async def call_cheap_full(
@@ -804,180 +564,30 @@ async def call_cheap_full(
     max_tokens: int = 8192,
     tools: list | None = None,
 ) -> dict:
-    """Call cheap model — returns full response dict with tool_calls and usage.
-
-    When `tools` is provided, they are passed through to the model and
-    returned to the caller (no local tool execution).
-    """
-    headers = {
-        "Authorization": f"Bearer {CHEAP_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    if _is_openrouter(CHEAP_BASE_URL):
-        headers["HTTP-Referer"] = "http://localhost:8800"
-        headers["X-Title"] = "LowCostLLM"
-
-    payload: dict = {
-        "model": CHEAP_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens or 8192,
-    }
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-        resp = await client.post(CHEAP_CHAT_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        choice = data["choices"][0]
-        msg = choice["message"]
-
-        return {
-            "content": msg.get("content", "") or "",
-            "tool_calls": msg.get("tool_calls"),
-            "model": data.get("model", CHEAP_MODEL),
-            "usage": data.get("usage"),
-            "finish_reason": choice.get("finish_reason", "stop"),
-        }
-
-
-async def call_expensive_full(
-    messages: list[dict],
-    temperature: float = 0.7,
-    max_tokens: int = 8192,
-    tools: list | None = None,
-) -> dict:
-    """Call expensive model — returns full response dict with tool_calls and usage.
-
-    When `tools` is provided, they are passed through to the model and
-    returned to the caller (no local tool execution).
-    Falls back to FALLBACK_MODEL on API failure.
-    """
-    import logging
-    _logger = logging.getLogger(__name__)
-
-    headers = {
-        "Authorization": f"Bearer {EXPENSIVE_API_KEY}",
-        "Content-Type": "application/json",
+    """Call cheap model — returns full response dict for proxy compatibility."""
+    text = await call_cheap(messages, temperature, max_tokens, tools)
+    return {
+        "content": text,
+        "tool_calls": None,
+        "model": get_cheap_model(),
+        "usage": get_last_usage(),
+        "finish_reason": "stop",
     }
 
-    payload: dict = {
-        "model": EXPENSIVE_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
 
-    try:
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-            resp = await client.post(
-                EXPENSIVE_CHAT_URL, json=payload, headers=headers
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            choice = data["choices"][0]
-            msg = choice["message"]
+# ── Image generation stubs (not implemented in SDK path yet) ─────
 
-            return {
-                "content": msg.get("content", "") or "",
-                "tool_calls": msg.get("tool_calls"),
-                "model": data.get("model", EXPENSIVE_MODEL),
-                "usage": data.get("usage"),
-                "finish_reason": choice.get("finish_reason", "stop"),
-            }
-    except Exception:
-        _logger.exception("Expensive model failed, falling back")
-        fallback_headers = {
-            "Authorization": f"Bearer {FALLBACK_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:8800",
-            "X-Title": "LowCostLLM",
-        }
-        fb_payload: dict = {
-            "model": FALLBACK_MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if tools:
-            fb_payload["tools"] = tools
-            fb_payload["tool_choice"] = "auto"
-
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-            resp = await client.post(
-                f"{FALLBACK_BASE_URL}/chat/completions", json=fb_payload, headers=fallback_headers
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            choice = data["choices"][0]
-            msg = choice["message"]
-
-            return {
-                "content": msg.get("content", "") or "",
-                "tool_calls": msg.get("tool_calls"),
-                "model": f"{FALLBACK_MODEL} (fallback)",
-                "usage": data.get("usage"),
-                "finish_reason": choice.get("finish_reason", "stop"),
-            }
+_generated_images: list[str] = []
 
 
-async def stream_expensive_full(
-    messages: list[dict],
-    temperature: float = 0.7,
-    max_tokens: int = 2048,
-    tools: list | None = None,
-):
-    """Stream from expensive model — yields {delta, finish_reason, model, usage} dicts.
+def _clear_generated_images() -> None:
+    global _generated_images
+    _generated_images = []
 
-    When `tools` is provided, they are passed through and tool_call deltas
-    are relayed to the caller (no local tool execution).
-    """
-    headers = {
-        "Authorization": f"Bearer {EXPENSIVE_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
-    payload: dict = {
-        "model": EXPENSIVE_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": True,
-    }
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
+def _get_generated_images() -> list[str]:
+    return list(_generated_images)
 
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-        async with client.stream(
-            "POST", EXPENSIVE_CHAT_URL, json=payload, headers=headers
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                except Exception:
-                    continue
 
-                choice = data["choices"][0]
-                delta = choice.get("delta", {})
-                finish_reason = choice.get("finish_reason")
-                model = data.get("model", EXPENSIVE_MODEL)
-                usage = data.get("usage")
-
-                yield {
-                    "delta": delta,
-                    "finish_reason": finish_reason,
-                    "model": model,
-                    "usage": usage,
-                }
+async def _wait_for_images(timeout: float = 30.0) -> list[str]:
+    return list(_generated_images)

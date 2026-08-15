@@ -27,9 +27,25 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "deepseek/deepseek-v4-flash")
 FALLBACK_API_KEY = os.getenv("FALLBACK_API_KEY", "")
 FALLBACK_BASE_URL = os.getenv("FALLBACK_BASE_URL", "https://openrouter.ai/api/v1")
 
-# ── Runtime model overrides (set by /model command) ──────────────────
+# ── Runtime model overrides (set by /model command, persisted to DB) ──
 _cheap_override: str | None = None
 _expensive_override: str | None = None
+
+
+def _load_overrides_from_db() -> None:
+    """Restore model overrides from the database after restart."""
+    global _cheap_override, _expensive_override
+    try:
+        from db import get_conn
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT cheap_override, expensive_override FROM model_overrides WHERE id = 1"
+        ).fetchone()
+        if row:
+            _cheap_override = row["cheap_override"]
+            _expensive_override = row["expensive_override"]
+    except Exception:
+        pass
 
 
 def get_cheap_model() -> str:
@@ -43,11 +59,28 @@ def get_expensive_model() -> str:
 def set_cheap_model(model_id: str | None) -> None:
     global _cheap_override
     _cheap_override = model_id
+    _save_overrides_to_db()
 
 
 def set_expensive_model(model_id: str | None) -> None:
     global _expensive_override
     _expensive_override = model_id
+    _save_overrides_to_db()
+
+
+def _save_overrides_to_db() -> None:
+    """Persist overrides so they survive restarts."""
+    try:
+        from db import get_conn
+        conn = get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO model_overrides (id, cheap_override, expensive_override) "
+            "VALUES (1, ?, ?)",
+            (_cheap_override, _expensive_override),
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 
 # ── Available models registry ──────────────────────────────────────
@@ -95,6 +128,70 @@ def estimate_cost(model_id: str, output_chars: int) -> float:
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ALLOWED_USERS = os.getenv("TELEGRAM_ALLOWED_USERS", "")
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")
+
+# ── Voice / TTS settings (set by /voice command, persisted to DB) ──
+VOICE_ENABLED_DEFAULT = os.getenv("VOICE_ENABLED", "0") == "1"
+VOICE_ENGINE_DEFAULT = os.getenv("VOICE_ENGINE", "edge")  # "edge" or "kokoro"
+VOICE_NAME = os.getenv("VOICE_NAME", "en-US-JennyNeural")   # edge-tts voice (female)
+VOICE_RATE = os.getenv("VOICE_RATE", "+0%")                 # edge-tts speed
+KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_sarah")        # kokoro voice id (female)
+
+_voice_enabled_override: bool | None = None
+_voice_engine_override: str | None = None
+
+
+def _load_voice_from_db() -> None:
+    """Restore voice settings from the database after restart."""
+    global _voice_enabled_override, _voice_engine_override
+    try:
+        from db import get_conn
+        row = get_conn().execute(
+            "SELECT voice_enabled, voice_engine FROM app_settings WHERE id = 1"
+        ).fetchone()
+        if row:
+            _voice_enabled_override = bool(row["voice_enabled"])
+            _voice_engine_override = row["voice_engine"]
+    except Exception:
+        pass
+
+
+def get_voice_enabled() -> bool:
+    if _voice_enabled_override is not None:
+        return _voice_enabled_override
+    return VOICE_ENABLED_DEFAULT
+
+
+def get_voice_engine() -> str:
+    return _voice_engine_override or VOICE_ENGINE_DEFAULT
+
+
+def set_voice_enabled(enabled: bool) -> None:
+    global _voice_enabled_override
+    _voice_enabled_override = enabled
+    _save_voice_to_db()
+
+
+def set_voice_engine(engine: str) -> None:
+    global _voice_engine_override
+    _voice_engine_override = engine
+    _save_voice_to_db()
+
+
+def _save_voice_to_db() -> None:
+    """Persist voice settings so they survive restarts."""
+    try:
+        from db import get_conn
+        conn = get_conn()
+        conn.execute(
+            "UPDATE app_settings SET voice_enabled = ?, voice_engine = ? WHERE id = 1",
+            (
+                1 if get_voice_enabled() else 0,
+                get_voice_engine(),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 # Server
 HOST = os.getenv("HOST", "127.0.0.1")

@@ -2,7 +2,7 @@
 import json
 import time
 
-from config import CHEAP_MODEL
+from config import get_cheap_model
 from db import cache_lookup, insert_qa
 from llm import (
     call_cheap,
@@ -12,6 +12,7 @@ from llm import (
     stream_expensive_full,
 )
 from stats import record_request
+from processor import _is_rejection
 
 
 def _record(hit: bool, model: str, usage: dict | None = None, tool_calls: int = 0):
@@ -28,14 +29,24 @@ Here is that answer for reference:
 {expert_answer}
 ---
 
-IMPORTANT — RELEVANCE CHECK:
-If the expert answer above is about a COMPLETELY DIFFERENT topic than the
-user's question, do NOT try to adapt it. Reply with EXACTLY the single word
-"IRRELEVANT" and nothing else.
+IMPORTANT — RELEVANCE CHECK (do this FIRST):
+Read the user's question. Decide whether the expert answer above is about the
+SAME topic.
 
-Otherwise, use the expert answer as your knowledge source. Answer the user's
+- If it is about a DIFFERENT topic (e.g. the expert answer is about an anime
+  and the user is asking about a novel), STOP immediately. Do NOT explain the
+  mismatch, do NOT apologize, do NOT answer the question anyway. Reply with
+  EXACTLY one word and nothing else:
+
+IRRELEVANT
+
+- Only if it is genuinely about the SAME topic, proceed.
+
+If you proceed, use the expert answer as your knowledge source. Answer the user's
 question accurately. If the new question differs from the original, adapt the
 answer appropriately while preserving factual accuracy.
+
+Do NOT say "based on", "according to", or cite the expert answer in any way.
 
 User's question: {user_query}"""
 
@@ -80,7 +91,7 @@ async def handle_chat_completion(body: dict) -> dict:
     match = await cache_lookup(match_query)
     response_content = None
     response_tool_calls = None
-    model_used = CHEAP_MODEL
+    model_used = get_cheap_model()
     usage = None
     finish_reason = "stop"
 
@@ -101,21 +112,21 @@ async def handle_chat_completion(body: dict) -> dict:
             result = {
                 "content": text,
                 "tool_calls": None,
-                "model": f"{CHEAP_MODEL} (cached)",
+                "model": f"{get_cheap_model()} (cached)",
                 "usage": None,
                 "finish_reason": "stop",
             }
 
         if (
             not result.get("tool_calls")
-            and result.get("content", "").strip().upper().startswith("IRRELEVANT")
+            and _is_rejection(result.get("content", ""))
         ):
             _record(hit=False, model="irrelevant-escalated")
             match = None
         else:
             response_content = result["content"]
             response_tool_calls = result.get("tool_calls")
-            model_used = result.get("model", f"{CHEAP_MODEL} (cached)")
+            model_used = result.get("model", f"{get_cheap_model()} (cached)")
             usage = result.get("usage")
             finish_reason = result.get("finish_reason", "stop")
             _record(hit=True, model=model_used, usage=usage)
@@ -231,14 +242,11 @@ async def stream_chat_completion(body: dict):
         )
         content = result["content"]
         tool_calls = result.get("tool_calls")
-        model_used = result.get("model", f"{CHEAP_MODEL} (cached)")
+        model_used = result.get("model", f"{get_cheap_model()} (cached)")
         usage = result.get("usage")
         finish_reason = result.get("finish_reason", "stop")
 
-        if (
-            not tool_calls
-            and content.strip().upper().startswith("IRRELEVANT")
-        ):
+        if not tool_calls and _is_rejection(content):
             _record(hit=False, model="irrelevant-escalated")
             match = None
         else:

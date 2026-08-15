@@ -5,7 +5,8 @@ Both the Flask Chat webhook and Telegram bot call this same function.
 import datetime as _dt
 import asyncio
 import logging
-from config import CHEAP_MODEL
+import re as _re
+from config import get_cheap_model
 from db import cache_lookup, insert_qa, increment_hit_count
 from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images
 from stats import record_request
@@ -16,29 +17,80 @@ _TODAY = _dt.datetime.now().strftime("%A, %d %B %Y")
 _DATE_CONTEXT = f"Today's date is {_TODAY}. Use this for any time-sensitive context."
 
 CHEAP_MODEL_CONTEXT_PROMPT = """A similar question was previously answered by an expert AI.
-Here is that answer for reference:
+Here is that answer as a FOUNDATION to build on:
 
 ---
 {expert_answer}
 ---
 
-IMPORTANT — RELEVANCE CHECK:
-If the expert answer above is about a COMPLETELY DIFFERENT topic than the
-user's question, do NOT try to adapt it. Reply with EXACTLY the single word
-"IRRELEVANT" and nothing else.
+IMPORTANT — RELEVANCE CHECK (do this FIRST):
+Read the user's question. Decide whether the expert answer above is about the
+SAME topic.
 
-Otherwise, use the expert answer as your knowledge source. Answer the user's
-question accurately. If the new question differs from the original, adapt the
-answer appropriately while preserving factual accuracy.
+- If it is about a DIFFERENT topic (e.g. the expert answer is about an anime
+  and the user is asking about a novel), STOP immediately. Do NOT explain the
+  mismatch, do NOT apologize, do NOT answer the question anyway. Reply with
+  EXACTLY one word and nothing else:
+
+IRRELEVANT
+
+- Only if it is genuinely about the SAME topic, proceed.
+
+If you proceed, use the expert answer as a FOUNDATION — not a constraint. You have
+access to tools (web search) to add fresh information, verify facts, or expand
+on what's cached. The expert answer may be outdated or incomplete:
+- Augment it with new details from web search
+- Verify any claims that seem questionable
+- Add context the expert answer missed
+- Replace stale facts with current ones
+
+Do NOT say "based on", "according to", or cite the expert answer in any way.
+Answer the user's question directly, accurately and thoroughly.
 
 User's question: {user_query}"""
+
+
+_REJECTION_PHRASES = (
+    # Metadata leak — model cites the cached "expert" material instead of answering.
+    "expert answer", "expert material", "expert says", "expert reference",
+    "expert ai", "cached answer", "cached expert", "cached response",
+    "source material", "provided information", "provided reference",
+    "provided by an expert",
+    # Topic mismatch — model noticed the cached answer is about a different subject.
+    "unrelated", "different topic", "completely different", "not related",
+    "off-topic", "off topic", "wrong topic", "mismatch", "nothing to do with",
+    "no relation", "different subject", "another topic", "not the same topic",
+    "fresh answer", "from scratch",
+)
+
+
+def _is_rejection(answer: str) -> bool:
+    """Return True if the cheap model rejected the cached answer.
+
+    Signals (scoped to the first 300 chars to avoid false positives in a
+    legitimate answer body):
+      1. The literal IRRELEVANT keyword.
+      2. Metadata-leak phrases ("expert answer", "reference", ...).
+      3. Topic-mismatch phrases ("unrelated", "different topic", ...).
+
+    This errs on the side of escalating: a false positive only costs one
+    expensive call, while a false negative serves unrelated content as a
+    "cached" hit.
+    """
+    if not answer:
+        return True
+    clean = _re.sub(r"</?think\w*>", "", answer, flags=_re.IGNORECASE).strip()
+    head = clean[:300].lower()
+    if "irrelevant" in head:
+        return True
+    return any(p in head for p in _REJECTION_PHRASES)
 
 
 async def process_query(
     user_query: str,
     chat_history: str = "",
     system_prompt: str | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, list[str]]:
     """Process a user query through the two-tier cache → cheap → expensive pipeline.
 
     Args:
@@ -87,16 +139,12 @@ async def process_query(
         answer = await call_cheap(messages, tools=None)  # tools enabled, max 10 rounds
 
         # Self-check: did the cheap model reject the cached answer?
-        # Strip XML thinking tags first. Models may explain WHY it's irrelevant
-        # before saying the word — scan first 300 chars for IRRELEVANT.
-        import re as _re
-        clean = _re.sub(r'</?think\w*>', '', answer, flags=_re.IGNORECASE).strip()
-        if "IRRELEVANT" in clean[:300].upper():
+        if _is_rejection(answer):
             record_request(hit=False, model="irrelevant-escalated")
             match = None  # force expensive path below
         else:
             increment_hit_count(match["id"])
-            model_used = f"{CHEAP_MODEL} (cached)"
+            model_used = f"{get_cheap_model()} (cached)"
             record_request(hit=True, model=model_used)
             return answer, model_used, _get_generated_images()
 
@@ -157,14 +205,12 @@ async def process_query_stream(
         messages.append({"role": "user", "content": context_prompt})
         answer = await call_cheap(messages, tools=None)  # tools enabled, max 10 rounds
 
-        import re as _re
-        clean = _re.sub(r'</?think\w*>', '', answer, flags=_re.IGNORECASE).strip()
-        if "IRRELEVANT" in clean[:300].upper():
+        if _is_rejection(answer):
             record_request(hit=False, model="irrelevant-escalated")
             match = None
         else:
             increment_hit_count(match["id"])
-            model_used = f"{CHEAP_MODEL} (cached)"
+            model_used = f"{get_cheap_model()} (cached)"
             record_request(hit=True, model=model_used)
             if asyncio.iscoroutinefunction(callback):
                 await callback(answer)

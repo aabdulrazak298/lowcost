@@ -6,3 +6,6 @@ python-dotenv==1.0.1
 python-telegram-bot>=21.0
 sentence-transformers>=3.0.0
 numpy>=1.24.0
+telegramify-markdown>=1.2.0
+httpx>=0.28.0
+openai-agents>=0.19.0

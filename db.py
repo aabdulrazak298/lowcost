@@ -45,6 +45,11 @@ def init_db() -> None:
         conn.execute("ALTER TABLE qa_cache ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0")
     except Exception:
         pass
+    # Migration: add purpose column (chat | code) for cache separation
+    try:
+        conn.execute("ALTER TABLE qa_cache ADD COLUMN purpose TEXT NOT NULL DEFAULT 'chat'")
+    except Exception:
+        pass
 
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_qa_created
@@ -81,6 +86,8 @@ def init_db() -> None:
 
     _init_conversations_table(conn)
     _init_stats_table(conn)
+    _init_overrides_table(conn)
+    _init_app_settings_table(conn)
 
 
 def _init_conversations_table(conn: sqlite3.Connection) -> None:
@@ -128,12 +135,12 @@ def _init_conversations_table(conn: sqlite3.Connection) -> None:
         """)
 
 
-def insert_qa(query: str, answer: str, model_used: str) -> int:
+def insert_qa(query: str, answer: str, model_used: str, purpose: str = "chat") -> int:
     """Insert a Q&A pair. Evicts oldest if over max. Returns the new row ID."""
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO qa_cache (query, answer, model_used) VALUES (?, ?, ?)",
-        (query, answer, model_used),
+        "INSERT INTO qa_cache (query, answer, model_used, purpose) VALUES (?, ?, ?, ?)",
+        (query, answer, model_used, purpose),
     )
     rid = cur.lastrowid
 
@@ -149,7 +156,7 @@ def insert_qa(query: str, answer: str, model_used: str) -> int:
 
     # Hot cache insert is best-effort — skip if lock contention
     try:
-        _hot_cache[str(rid)] = {"id": rid, "query": query, "answer": answer, "model_used": model_used, "hit_count": 0}
+        _hot_cache[str(rid)] = {"id": rid, "query": query, "answer": answer, "model_used": model_used, "hit_count": 0, "purpose": purpose}
         if len(_hot_cache) >= HOT_CACHE_MAX:
             _hot_cache.popitem(last=False)
     except Exception:
@@ -157,15 +164,44 @@ def insert_qa(query: str, answer: str, model_used: str) -> int:
     return rid
 
 
-def search_candidates(query: str, limit: int = 100) -> list[dict]:
+_FTS_STOP_WORDS = frozenset({
+    # articles / determiners
+    "a", "an", "the", "this", "that", "these", "those",
+    # pronouns
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us",
+    "them", "my", "your", "his", "its", "our", "their",
+    # question words
+    "what", "which", "who", "whom", "when", "where", "why", "how",
+    # copula / basic auxiliaries
+    "is", "are", "am", "was", "were", "be", "been", "being",
+    "do", "does", "did", "have", "has", "had",
+    # basic prepositions
+    "to", "of", "in", "on", "at", "by", "for", "with", "about", "into",
+    "from", "during", "between", "through", "over", "under",
+    # conversational fillers (heavy in this cache)
+    "tell", "more", "please", "get", "got", "want", "need", "just", "like",
+    "there", "here", "know", "think",
+})
+
+
+def search_candidates(query: str, limit: int = 100, purpose: str = "chat") -> list[dict]:
     """FTS5 pre-filter: find top N candidates by text relevance.
-    Only these candidates will be fuzzy-matched by RapidFuzz."""
+
+    Only these candidates are scored by the embedding model. Stop words are
+    dropped so the OR query matches on content words — otherwise "what is the
+    butlerian jihad in the dune universe" would match every entry containing
+    "the"/"is"/"in" and surface unrelated candidates.
+    """
     conn = get_conn()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=CACHE_TTL_DAYS)).isoformat()
 
     # Sanitize FTS5 query - escape special chars, wrap terms for better matching
     safe = query.replace('"', '""')
-    terms = [f'"{t}"' if len(t) > 2 else t for t in safe.split() if len(t) > 1]
+    terms = [
+        f'"{t}"'
+        for t in safe.split()
+        if len(t) > 1 and t.lower() not in _FTS_STOP_WORDS
+    ]
 
     if not terms:
         return []
@@ -173,12 +209,13 @@ def search_candidates(query: str, limit: int = 100) -> list[dict]:
     fts_query = " OR ".join(terms[:20])  # max 20 terms
 
     rows = conn.execute(
-        "SELECT qa.id, qa.query, qa.answer, qa.model_used, qa.hit_count "
+        "SELECT qa.id, qa.query, qa.answer, qa.model_used, qa.hit_count, "
+        "       bm25(qa_cache_fts) AS rank "
         "FROM qa_cache_fts fts "
         "JOIN qa_cache qa ON fts.rowid = qa.id "
-        "WHERE qa_cache_fts MATCH ? AND qa.created_at >= ? "
+        "WHERE qa_cache_fts MATCH ? AND qa.created_at >= ? AND qa.purpose = ? "
         "ORDER BY rank LIMIT ?",
-        (fts_query, cutoff, limit),
+        (fts_query, cutoff, purpose, limit),
     ).fetchall()
 
     return [dict(r) for r in rows]
@@ -244,33 +281,35 @@ def _hot_cache_bump(cache_id: int) -> None:
             break
 
 
-async def hot_cache_lookup(query: str) -> dict | None:
+async def hot_cache_lookup(query: str, purpose: str = "chat") -> dict | None:
     async with _hot_cache_lock:
-        entry = _hot_cache.get(query)
+        key = f"{purpose}:{query}"
+        entry = _hot_cache.get(key)
         if entry:
-            _hot_cache.move_to_end(query)
+            _hot_cache.move_to_end(key)
         return entry
 
 
-async def hot_cache_put(query: str, entry: dict) -> None:
+async def hot_cache_put(query: str, entry: dict, purpose: str = "chat") -> None:
     async with _hot_cache_lock:
+        key = f"{purpose}:{query}"
         if len(_hot_cache) >= HOT_CACHE_MAX:
             _hot_cache.popitem(last=False)
-        _hot_cache[query] = entry
+        _hot_cache[key] = entry
 
 
-async def cache_lookup(match_query: str) -> dict | None:
+async def cache_lookup(match_query: str, purpose: str = "chat") -> dict | None:
     """Unified cache lookup: hot cache → FTS5 → LLM smart match → fallback full scan.
     Uses LLM-based semantic matching instead of RapidFuzz string distance."""
     from matcher import smart_cache_lookup
 
-    hot = await hot_cache_lookup(match_query)
+    hot = await hot_cache_lookup(match_query, purpose)
     if hot:
         return hot
 
-    match = await smart_cache_lookup(match_query)
+    match = await smart_cache_lookup(match_query, purpose)
     if match:
-        await hot_cache_put(match_query, match)
+        await hot_cache_put(match_query, match, purpose)
         return match
 
     return None
@@ -346,6 +385,30 @@ def clear_user_history(user_id: int) -> int:
 
 
 # -- Stats persistence ---------------------------------------------
+
+def _init_overrides_table(conn: sqlite3.Connection) -> None:
+    """Create model_overrides table for persisting /model choices."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_overrides (
+            id                  INTEGER PRIMARY KEY CHECK (id = 1),
+            cheap_override      TEXT,
+            expensive_override  TEXT
+        )
+    """)
+    conn.execute("INSERT OR IGNORE INTO model_overrides (id) VALUES (1)")
+
+
+def _init_app_settings_table(conn: sqlite3.Connection) -> None:
+    """Create app_settings table for persisting voice (/voice) choices."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            voice_enabled INTEGER NOT NULL DEFAULT 0,
+            voice_engine  TEXT    NOT NULL DEFAULT 'edge'
+        )
+    """)
+    conn.execute("INSERT OR IGNORE INTO app_settings (id) VALUES (1)")
+
 
 def _init_stats_table(conn: sqlite3.Connection) -> None:
     conn.execute("""

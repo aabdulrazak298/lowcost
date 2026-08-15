@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from db import init_db
 from proxy import handle_chat_completion, stream_chat_completion
+from code_proxy import handle_code_completion, stream_code_completion
 from webhook import handle_webhook_chat
 from config import (
     AUTH_KEY, API_KEY, CHEAP_MODEL,
@@ -57,6 +58,14 @@ async def lifespan(app: FastAPI):
 
     from stats import init_from_db, flush_to_db
     init_from_db()
+
+    # Restore model overrides from previous session
+    from config import _load_overrides_from_db
+    _load_overrides_from_db()
+
+    # Restore voice settings from previous session
+    from config import _load_voice_from_db
+    _load_voice_from_db()
 
     flush_task = asyncio.create_task(_periodic_flush())
 
@@ -335,6 +344,55 @@ async def chat_completions(request: Request, _auth=Depends(_auth_dependency)):
 
     except Exception as e:
         logger.exception("Chat completion failed")
+        if body_dict.get("stream"):
+            error_chunk = json.dumps(
+                {"error": {"message": str(e), "type": "server_error"}}
+            )
+            return StreamingResponse(
+                iter([f"data: {error_chunk}\n\n", "data: [DONE]\n\n"]),
+                media_type="text/event-stream",
+            )
+        return JSONResponse(
+            {"error": {"message": str(e), "type": "server_error"}},
+            status_code=500,
+        )
+
+
+# ── Code completions (judge-based cache routing) ────────────────
+
+
+@app.post("/v1/code/chat/completions")
+@app.post("/code/chat/completions")
+async def code_completions(request: Request, _auth=Depends(_auth_dependency)):
+    try:
+        body = await request.json()
+        req = ChatCompletionRequest.model_validate(body)
+        body_dict = req.model_dump(exclude_none=True)
+    except ValidationError as e:
+        return JSONResponse(
+            {"error": {"message": str(e.errors()[0]["msg"]), "type": "invalid_request"}},
+            status_code=422,
+        )
+
+    try:
+        if body_dict.get("stream"):
+            return StreamingResponse(
+                stream_code_completion(body_dict),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        if await _check_dedup(body_dict):
+            return JSONResponse(
+                {"error": {"message": "Duplicate request", "type": "dedup"}},
+                status_code=409,
+            )
+
+        result = await handle_code_completion(body_dict)
+        return JSONResponse(result)
+
+    except Exception as e:
+        logger.exception("Code completion failed")
         if body_dict.get("stream"):
             error_chunk = json.dumps(
                 {"error": {"message": str(e), "type": "server_error"}}
