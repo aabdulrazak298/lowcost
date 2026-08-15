@@ -1,5 +1,6 @@
 """Core orchestrator: match -> route -> cache -> respond."""
 import json
+import logging
 import time
 
 from config import get_cheap_model
@@ -13,6 +14,8 @@ from llm import (
 )
 from stats import record_request
 from processor import _is_rejection
+
+logger = logging.getLogger("lowcostllm.chat")
 
 
 def _record(hit: bool, model: str, usage: dict | None = None, tool_calls: int = 0):
@@ -94,6 +97,8 @@ async def handle_chat_completion(body: dict) -> dict:
     model_used = get_cheap_model()
     usage = None
     finish_reason = "stop"
+    decision_source = "cache-miss"
+    rationale = "no cache match"
 
     if match:
         context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
@@ -123,6 +128,8 @@ async def handle_chat_completion(body: dict) -> dict:
         ):
             _record(hit=False, model="irrelevant-escalated")
             match = None
+            decision_source = "irrelevant-escalated"
+            rationale = "cached answer judged IRRELEVANT, escalating to expensive"
         else:
             response_content = result["content"]
             response_tool_calls = result.get("tool_calls")
@@ -130,6 +137,8 @@ async def handle_chat_completion(body: dict) -> dict:
             usage = result.get("usage")
             finish_reason = result.get("finish_reason", "stop")
             _record(hit=True, model=model_used, usage=usage)
+            decision_source = "cache-hit"
+            rationale = "cached expert answer accepted by cheap model"
 
     if not match:
         cache_aware = [
@@ -191,6 +200,14 @@ async def handle_chat_completion(body: dict) -> dict:
     if response_tool_calls:
         response["choices"][0]["message"]["tool_calls"] = response_tool_calls
 
+    response["_routing_meta"] = {
+        "selected_model": model_used,
+        "rationale": rationale,
+        "decision_source": decision_source,
+    }
+    logger.info("chat routing: source=%s model=%s rationale=%s",
+                decision_source, model_used, rationale)
+
     return response
 
 
@@ -227,6 +244,7 @@ async def stream_chat_completion(body: dict):
     created = int(time.time())
 
     match = await cache_lookup(match_query)
+    decision_source = "cache-miss"
 
     if match:
         # Cache hit — buffer cheap response, verify IRRELEVANT, then stream
@@ -249,6 +267,7 @@ async def stream_chat_completion(body: dict):
         if not tool_calls and _is_rejection(content):
             _record(hit=False, model="irrelevant-escalated")
             match = None
+            decision_source = "irrelevant-escalated"
         else:
             # Stream buffered response
             if tool_calls:
@@ -277,6 +296,7 @@ async def stream_chat_completion(body: dict):
 
             yield "data: [DONE]\n\n"
             _record(hit=True, model=model_used, usage=usage)
+            logger.info("chat routing: source=cache-hit model=%s", model_used)
             return
 
     # Cache miss (or IRRELEVANT escalated) — stream from expensive model
@@ -294,6 +314,7 @@ async def stream_chat_completion(body: dict):
 
     full_text = ""
     model_used = "deepseek-v4-pro"
+    logger.info("chat routing: source=%s model=%s", decision_source, model_used)
 
     try:
         async for chunk in stream_expensive_full(

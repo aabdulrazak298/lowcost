@@ -358,7 +358,13 @@ async def chat_completions(request: Request, _auth=Depends(_auth_dependency)):
             )
 
         result = await handle_chat_completion(body_dict)
-        return JSONResponse(result)
+        routing_meta = result.pop("_routing_meta", {}) or {}
+        headers = {}
+        if routing_meta.get("selected_model"):
+            headers["x-model-router-selected-model"] = _header_safe(str(routing_meta["selected_model"]))
+        if routing_meta.get("rationale"):
+            headers["x-model-router-rationale"] = _header_safe(str(routing_meta["rationale"]))
+        return JSONResponse(result, headers=headers)
 
     except Exception as e:
         logger.exception("Chat completion failed")
