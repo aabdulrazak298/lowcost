@@ -481,11 +481,12 @@ async def _process_update_async(update_id: int, body: dict) -> None:
 @app.get("/admin")
 async def admin_dashboard(request: Request, _auth=Depends(_auth_dependency)):
     from db import get_cache_stats
-    from stats import get_stats
+    from stats import get_stats, get_code_stats
 
     return {
         "cache": get_cache_stats(),
         "usage": get_stats(),
+        "code": get_code_stats(),
     }
 
 

@@ -44,7 +44,7 @@ async def _classifier_route(
                 model_used = f"{result['model']} (code-cached)"
                 record_request(hit=True, model=model_used,
                                prompt_tokens=result["usage"]["prompt_tokens"],
-                               completion_tokens=result["usage"]["completion_tokens"])
+                               completion_tokens=result["usage"]["completion_tokens"], purpose="code")
                 return result, {
                     "selected_model": model_used,
                     "rationale": "session-affinity cheap",
@@ -54,7 +54,7 @@ async def _classifier_route(
         model_used = result["model"]
         record_request(hit=False, model=model_used,
                        prompt_tokens=result["usage"]["prompt_tokens"],
-                       completion_tokens=result["usage"]["completion_tokens"])
+                       completion_tokens=result["usage"]["completion_tokens"], purpose="code")
         _cache_fresh(result, match_query, model_used)
         return result, {
             "selected_model": model_used,
@@ -72,7 +72,7 @@ async def _classifier_route(
             model_used = result["model"]
             record_request(hit=False, model=model_used,
                            prompt_tokens=result["usage"]["prompt_tokens"],
-                           completion_tokens=result["usage"]["completion_tokens"])
+                           completion_tokens=result["usage"]["completion_tokens"], purpose="code")
             _cache_fresh(result, match_query, model_used)
             return result, {
                 "selected_model": model_used,
@@ -102,7 +102,7 @@ async def _classifier_route(
             model_used = f"{result['model']} (code-cached)"
             record_request(hit=True, model=model_used,
                            prompt_tokens=result["usage"]["prompt_tokens"],
-                           completion_tokens=result["usage"]["completion_tokens"])
+                           completion_tokens=result["usage"]["completion_tokens"], purpose="code")
             return result, {
                 "selected_model": model_used,
                 "rationale": rationale,
@@ -113,7 +113,7 @@ async def _classifier_route(
         model_used = result["model"]
         record_request(hit=False, model=model_used,
                        prompt_tokens=result["usage"]["prompt_tokens"],
-                       completion_tokens=result["usage"]["completion_tokens"])
+                       completion_tokens=result["usage"]["completion_tokens"], purpose="code")
         _cache_fresh(result, match_query, model_used)
         return result, {
             "selected_model": model_used,
@@ -125,7 +125,7 @@ async def _classifier_route(
     model_used = result["model"]
     record_request(hit=False, model=model_used,
                    prompt_tokens=result["usage"]["prompt_tokens"],
-                   completion_tokens=result["usage"]["completion_tokens"])
+                   completion_tokens=result["usage"]["completion_tokens"], purpose="code")
     _cache_fresh(result, match_query, model_used)
     return result, {
         "selected_model": model_used,
@@ -148,7 +148,7 @@ async def _stage_route(messages: list[dict], tools) -> tuple[dict, dict]:
         model_used = result["model"]
         record_request(hit=False, model=model_used,
                        prompt_tokens=result["usage"]["prompt_tokens"],
-                       completion_tokens=result["usage"]["completion_tokens"])
+                       completion_tokens=result["usage"]["completion_tokens"], purpose="code")
         return result, {
             "selected_model": model_used,
             "rationale": (
@@ -173,7 +173,7 @@ async def _stage_route(messages: list[dict], tools) -> tuple[dict, dict]:
             model_used = f"{result['model']} (code-cached)"
             record_request(hit=True, model=model_used,
                            prompt_tokens=result["usage"]["prompt_tokens"],
-                           completion_tokens=result["usage"]["completion_tokens"])
+                           completion_tokens=result["usage"]["completion_tokens"], purpose="code")
             return result, {
                 "selected_model": model_used,
                 "rationale": "stage cheap: " + ", ".join(rationales),
@@ -184,7 +184,7 @@ async def _stage_route(messages: list[dict], tools) -> tuple[dict, dict]:
         model_used = result["model"]
         record_request(hit=False, model=model_used,
                        prompt_tokens=result["usage"]["prompt_tokens"],
-                       completion_tokens=result["usage"]["completion_tokens"])
+                       completion_tokens=result["usage"]["completion_tokens"], purpose="code")
         return result, {
             "selected_model": model_used,
             "rationale": "stage cheap (no cache match): " + ", ".join(rationales),
@@ -195,7 +195,7 @@ async def _stage_route(messages: list[dict], tools) -> tuple[dict, dict]:
     model_used = result["model"]
     record_request(hit=False, model=model_used,
                    prompt_tokens=result["usage"]["prompt_tokens"],
-                   completion_tokens=result["usage"]["completion_tokens"])
+                   completion_tokens=result["usage"]["completion_tokens"], purpose="code")
     return result, {
         "selected_model": model_used,
         "rationale": "stage expensive: " + ", ".join(rationales),
@@ -234,7 +234,7 @@ async def route_and_answer(
         model_used = result["model"]
         record_request(hit=False, model=model_used,
                        prompt_tokens=result["usage"]["prompt_tokens"],
-                       completion_tokens=result["usage"]["completion_tokens"])
+                       completion_tokens=result["usage"]["completion_tokens"], purpose="code")
         _cache_fresh(result, match_query, model_used)
         return result, {
             "selected_model": model_used,
@@ -253,7 +253,7 @@ async def route_and_answer(
     model_used = result["model"]
     record_request(hit=False, model=model_used,
                    prompt_tokens=result["usage"]["prompt_tokens"],
-                   completion_tokens=result["usage"]["completion_tokens"])
+                   completion_tokens=result["usage"]["completion_tokens"], purpose="code")
     _cache_fresh(result, match_query, model_used)
     return result, {
         "selected_model": model_used,

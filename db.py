@@ -410,40 +410,46 @@ def _init_app_settings_table(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT OR IGNORE INTO app_settings (id) VALUES (1)")
 
 
+# Table names for per-purpose stats snapshots (chat vs code).
+_STATS_TABLES = {"chat": "stats_snapshot", "code": "stats_snapshot_code"}
+
+
 def _init_stats_table(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS stats_snapshot (
-            id          INTEGER PRIMARY KEY CHECK (id = 1),
-            total_requests          INTEGER NOT NULL DEFAULT 0,
-            cache_hits              INTEGER NOT NULL DEFAULT 0,
-            cache_misses            INTEGER NOT NULL DEFAULT 0,
-            irrelevant_escalations  INTEGER NOT NULL DEFAULT 0,
-            expensive_calls         INTEGER NOT NULL DEFAULT 0,
-            cheap_calls             INTEGER NOT NULL DEFAULT 0,
-            tool_calls_total        INTEGER NOT NULL DEFAULT 0,
-            prompt_tokens           INTEGER NOT NULL DEFAULT 0,
-            completion_tokens       INTEGER NOT NULL DEFAULT 0,
-            total_tokens            INTEGER NOT NULL DEFAULT 0,
-            updated_at              TEXT    NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-    conn.execute("INSERT OR IGNORE INTO stats_snapshot (id) VALUES (1)")
-    _migrate_stats_table(conn)
+    for table in _STATS_TABLES.values():
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                total_requests          INTEGER NOT NULL DEFAULT 0,
+                cache_hits              INTEGER NOT NULL DEFAULT 0,
+                cache_misses            INTEGER NOT NULL DEFAULT 0,
+                irrelevant_escalations  INTEGER NOT NULL DEFAULT 0,
+                expensive_calls         INTEGER NOT NULL DEFAULT 0,
+                cheap_calls             INTEGER NOT NULL DEFAULT 0,
+                tool_calls_total        INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens           INTEGER NOT NULL DEFAULT 0,
+                completion_tokens       INTEGER NOT NULL DEFAULT 0,
+                total_tokens            INTEGER NOT NULL DEFAULT 0,
+                updated_at              TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute(f"INSERT OR IGNORE INTO {table} (id) VALUES (1)")
+        _migrate_stats_table(conn, table)
 
 
-def _migrate_stats_table(conn: sqlite3.Connection) -> None:
+def _migrate_stats_table(conn: sqlite3.Connection, table: str) -> None:
     """Add token columns if missing from older schema."""
-    existing = conn.execute("PRAGMA table_info(stats_snapshot)").fetchall()
+    existing = conn.execute(f"PRAGMA table_info({table})").fetchall()
     cols = {r[1] for r in existing}
     for col in ("prompt_tokens", "completion_tokens", "total_tokens"):
         if col not in cols:
-            conn.execute(f"ALTER TABLE stats_snapshot ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
 
 
-def save_stats(stats: dict) -> None:
+def save_stats(stats: dict, purpose: str = "chat") -> None:
+    table = _STATS_TABLES.get(purpose, "stats_snapshot")
     conn = get_conn()
-    conn.execute("""
-        UPDATE stats_snapshot SET
+    conn.execute(f"""
+        UPDATE {table} SET
             total_requests = ?,
             cache_hits = ?,
             cache_misses = ?,
@@ -471,10 +477,11 @@ def save_stats(stats: dict) -> None:
     conn.commit()
 
 
-def load_stats() -> dict:
+def load_stats(purpose: str = "chat") -> dict:
+    table = _STATS_TABLES.get(purpose, "stats_snapshot")
     conn = get_conn()
     row = conn.execute(
-        "SELECT * FROM stats_snapshot WHERE id = 1"
+        f"SELECT * FROM {table} WHERE id = 1"
     ).fetchone()
     if row is None:
         return {}
