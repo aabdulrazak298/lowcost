@@ -210,3 +210,12 @@ API_KEY = os.getenv("API_KEY", "")
 # Rate limiting
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+
+# ── Code-path routing (Switchyard-inspired) ──
+CODE_ROUTE_MODE = os.getenv("CODE_ROUTE_MODE", "auto")
+SESSION_AFFINITY = os.getenv("SESSION_AFFINITY", "1") == "1"
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
+JUDGE_BASE_THRESHOLD = float(os.getenv("JUDGE_BASE_THRESHOLD", "0.5"))
+JUDGE_THRESHOLD_STEP = float(os.getenv("JUDGE_THRESHOLD_STEP", "0.1"))
+STAGE_CONFIDENCE_THRESHOLD = float(os.getenv("STAGE_CONFIDENCE_THRESHOLD", "0.5"))
+STAGE_RECENT_TURN_WINDOW = int(os.getenv("STAGE_RECENT_TURN_WINDOW", "3"))

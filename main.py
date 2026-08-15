@@ -226,6 +226,12 @@ async def _check_dedup(body: dict) -> bool:
     return False
 
 
+def _header_safe(value: str) -> str:
+    """HTTP header values must be latin-1 encodable; replace any non-latin-1
+    characters (e.g. em dashes) so routing headers never 500."""
+    return value.encode("latin-1", "replace").decode("latin-1")
+
+
 # ── Health ──────────────────────────────────────────────────────
 
 
@@ -264,6 +270,18 @@ async def list_models(_auth=Depends(_auth_dependency)):
         "data": [
             {"id": "lowcostllm", "object": "model", "owned_by": "lowcostllm"},
             {"id": "thinkllm", "object": "model", "owned_by": "thinkllm"},
+        ],
+    }
+
+
+@app.get("/v1/code/models")
+@app.get("/code/models")
+async def list_code_models(_auth=Depends(_auth_dependency)):
+    """OpenCode model-picker discovery alias — same shape as /v1/models."""
+    return {
+        "object": "list",
+        "data": [
+            {"id": "lowcostllm-code", "object": "model", "owned_by": "lowcostllm-code"},
         ],
     }
 
@@ -368,6 +386,7 @@ async def code_completions(request: Request, _auth=Depends(_auth_dependency)):
         body = await request.json()
         req = ChatCompletionRequest.model_validate(body)
         body_dict = req.model_dump(exclude_none=True)
+        body_dict["x_session_id"] = request.headers.get("x-session-id")
     except ValidationError as e:
         return JSONResponse(
             {"error": {"message": str(e.errors()[0]["msg"]), "type": "invalid_request"}},
@@ -389,7 +408,13 @@ async def code_completions(request: Request, _auth=Depends(_auth_dependency)):
             )
 
         result = await handle_code_completion(body_dict)
-        return JSONResponse(result)
+        routing_meta = result.pop("_routing_meta", {}) or {}
+        headers = {}
+        if routing_meta.get("selected_model"):
+            headers["x-model-router-selected-model"] = _header_safe(str(routing_meta["selected_model"]))
+        if routing_meta.get("rationale"):
+            headers["x-model-router-rationale"] = _header_safe(str(routing_meta["rationale"]))
+        return JSONResponse(result, headers=headers)
 
     except Exception as e:
         logger.exception("Code completion failed")

@@ -2,29 +2,27 @@
 
 Separate from the general-chat path (proxy.py). General chat keeps its
 context-style + IRRELEVANT design; this module serves the NEW code endpoints
-(/v1/code/chat/completions) and uses the validated 3-way transferability judge:
+(/v1/code/chat/completions) and uses a JSON-verdict transferability judge:
 
-    cache match -> JUDGE (cheap) -> TRIVIAL / RESTRUCTURE / UNRELATED
-        TRIVIAL               -> cheap WRITER adapts the cached example
-        RESTRUCTURE/UNRELATED -> EXPENSIVE model answers fresh
+    cache match -> JUDGE (cheap) -> p_solve + capability_boundary
+        >= threshold -> cheap WRITER adapts the cached example
+        <  threshold  -> EXPENSIVE model answers fresh
     no match -> EXPENSIVE model
 
 Design decisions (see ~/scratch/lcl-injection-test/DESIGN.md):
   * Conservative routing: over-routing to expensive is preferred over garbage.
   * Expensive path has NO effective token cap (CODE_EXPENSIVE_MAX_TOKENS) so a
     reasoner (deepseek-v4-pro) can finish its hidden deliberation + answer.
-  * Same qa_cache as general chat for v1 (judge/IRRELEVANT gates keep it safe;
-    a `purpose` column is a possible follow-up).
-  * v1 streams text only; non-streaming returns tool_calls if the model emits
-    them. Full agentic tool-call streaming is a follow-up.
+  * Same qa_cache as general chat for v1 (judge gates keep it safe).
+  * v1 streams text + tool_calls; full agentic streaming is a follow-up.
 """
 
+import json as _json
 import logging
 import time
 
 from openai import AsyncOpenAI
 
-from db import cache_lookup, insert_qa
 from llm import (
     _build_cheap_client,
     _build_expensive_client,
@@ -32,7 +30,7 @@ from llm import (
     get_expensive_model,
 )
 from proxy import _extract_query_info, _format_sse
-from stats import record_request
+from session import session_id_from
 
 logger = logging.getLogger("lowcostllm.code")
 
@@ -53,30 +51,32 @@ DISABLE_REASONING = True
 def _no_reasoning() -> dict:
     return {"extra_body": {"reasoning": {"enabled": False}}} if DISABLE_REASONING else {}
 
+
 JUDGE_PROMPT = """You are a routing classifier for a code-assistance cache.
 
 You are given:
 1. A CACHED question and its CACHED answer (produced by an expert model).
 2. A NEW question the user is asking right now.
 
-Classify how much the cached answer must change to correctly solve the new question:
+Assess whether the cheap model can correctly adapt the cached answer to the new
+question, and return a single JSON object with these fields:
 
-- TRIVIAL: the new task is the SAME operation as the cached one, needing only
-  cosmetic edits — rename the function/variables, change a constant, change a
-  condition, or change input/output types. A weak model can adapt the cached
-  answer by editing a few tokens; it is essentially a ready template.
+- p_solve: float (0.0-1.0) — probability the cheap model can correctly adapt the
+  cached answer to the new question. Think about: does this require only cosmetic
+  edits, or does it need deep restructuring / new algorithms?
 
-- RESTRUCTURE: the cached answer is RELEVANT (same domain or concept) but cannot
-  be adapted by simple edits. It must be significantly rewritten, composed into
-  a larger program, or used repeatedly as a sub-step inside new logic (e.g.
-  wrapping it in a loop, calling it many times, combining it with other logic).
-  A weak model would likely fail to do this correctly.
+- capability_boundary: one of "supported" | "uncertain" | "unsupported"
+  - "supported": same operation + cosmetic edits — rename, change a constant,
+    tweak a condition, swap types
+  - "uncertain": same domain but needs real rewrite, composition, or multiple
+    adaptation steps
+  - "unsupported": different topic / no usable building block at all
 
-- UNRELATED: the cached answer is about a DIFFERENT topic or task and offers no
-  usable building block for the new question.
+- crux: the single hardest requirement for whole-task success (short string).
 
-Respond with EXACTLY one word on the first line: TRIVIAL, RESTRUCTURE, or
-UNRELATED. You may add a short reason on the second line.
+- primary_rule: which rule decided the boundary (short string).
+
+Return ONLY the JSON object, nothing else. Do not use markdown fences.
 
 CACHED question:
 {cached_q}
@@ -100,13 +100,52 @@ no explanation, no tests, no markdown fences.
 Task: {new_q}"""
 
 
-def _parse_class(content: str) -> str:
-    first = content.strip().splitlines()[0].strip().upper() if content.strip() else ""
-    for c in ("TRIVIAL", "RESTRUCTURE", "UNRELATED"):
-        if first.startswith(c):
-            return c
-    # Conservative default: unparseable judgement -> expensive.
-    return "UNRELATED"
+def _parse_verdict(content: str) -> dict | None:
+    """Parse the JSON verdict from judge output. Returns dict or None on failure."""
+    if not content or not content.strip():
+        return None
+    text = content.strip()
+    # Strip optional markdown fences
+    if text.startswith("```"):
+        lines = text.split("\n")
+        end = None
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip() == "```":
+                end = i
+                break
+        if end is not None and end > 0:
+            text = "\n".join(lines[1:end]).strip()
+        else:
+            text = "\n".join(lines[1:]).strip()
+    try:
+        verdict = _json.loads(text)
+    except _json.JSONDecodeError:
+        return None
+    if not isinstance(verdict, dict):
+        return None
+    p_solve = verdict.get("p_solve")
+    boundary = verdict.get("capability_boundary")
+    if p_solve is None or boundary is None:
+        return None
+    try:
+        p_solve = float(p_solve)
+    except (ValueError, TypeError):
+        return None
+    if not (0.0 <= p_solve <= 1.0):
+        return None
+    if boundary not in ("supported", "uncertain", "unsupported"):
+        return None
+    return {
+        "p_solve": p_solve,
+        "capability_boundary": boundary,
+        "crux": str(verdict.get("crux", "")),
+        "primary_rule": str(verdict.get("primary_rule", "")),
+    }
+
+
+# _parse_class is superseded by _parse_verdict — kept as doc reference only.
+# Original semantics: TRIVIAL → supported (high p_solve), RESTRUCTURE → uncertain
+# (mid p_solve), UNRELATED → unsupported (low p_solve).
 
 
 def _expensive_client_and_model() -> tuple[AsyncOpenAI, str]:
@@ -140,7 +179,7 @@ def _message_dict(resp) -> dict:
     return out
 
 
-async def _judge(cached_q: str, cached_a: str, new_q: str) -> str:
+async def _judge(cached_q: str, cached_a: str, new_q: str) -> dict | None:
     client = _build_cheap_client()
     model = get_cheap_model()
     prompt = JUDGE_PROMPT.format(cached_q=cached_q, cached_a=cached_a, new_q=new_q)
@@ -152,15 +191,29 @@ async def _judge(cached_q: str, cached_a: str, new_q: str) -> str:
         **_no_reasoning(),
     )
     content = resp.choices[0].message.content or ""
-    cls = _parse_class(content)
-    logger.info("code judge -> %s (raw=%r)", cls, content[:80])
-    return cls
+    verdict = _parse_verdict(content)
+    if verdict is None:
+        logger.info("code judge -> parse failure (raw=%r)", content[:120])
+    else:
+        logger.info(
+            "code judge -> p_solve=%.2f boundary=%s crux=%r rule=%r",
+            verdict["p_solve"],
+            verdict["capability_boundary"],
+            verdict.get("crux", ""),
+            verdict.get("primary_rule", ""),
+        )
+    return verdict
 
 
-async def _write_code(cached_q, cached_a, new_q, tools=None) -> dict:
+async def _write_code(cached_q, cached_a, messages: list[dict], tools=None) -> dict:
     client = _build_cheap_client()
     model = get_cheap_model()
-    prompt = WRITER_PROMPT.format(cached_q=cached_q, cached_a=cached_a, new_q=new_q)
+    last_user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user_msg = m.get("content", "") or ""
+            break
+    prompt = WRITER_PROMPT.format(cached_q=cached_q, cached_a=cached_a, new_q=last_user_msg)
     kw = dict(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -179,11 +232,11 @@ async def _write_code(cached_q, cached_a, new_q, tools=None) -> dict:
     }
 
 
-async def _answer_expensive(new_q, tools=None) -> dict:
+async def _answer_expensive(messages: list[dict], tools=None) -> dict:
     client, model = _expensive_client_and_model()
     kw = dict(
         model=model,
-        messages=[{"role": "user", "content": new_q}],
+        messages=messages,
         temperature=WRITER_TEMPERATURE,
         max_tokens=CODE_EXPENSIVE_MAX_TOKENS,
     )
@@ -198,61 +251,32 @@ async def _answer_expensive(new_q, tools=None) -> dict:
     }
 
 
-# ── Routing (shared by streaming + non-streaming) ─────────────────
-
-
-async def _route_and_respond(user_query: str, match_query: str, tools) -> tuple[dict, str]:
-    """Judge -> route -> answer. Returns (result_dict, model_label).
-
-    Caches fresh expensive answers (miss / RESTRUCTURE / UNRELATED); TRIVIAL
-    answers are a cache adaptation and are not re-inserted.
-    """
-    match = await cache_lookup(match_query, purpose="code")
-    is_trivial_hit = False
-    logger.info("code route: match=%s query=%r", bool(match), user_query[:60])
-
-    if match:
-        cls = await _judge(match["query"], match["answer"], user_query)
-        if cls == "TRIVIAL":
-            is_trivial_hit = True
-            result = await _write_code(match["query"], match["answer"], user_query, tools)
-            model_used = f"{result['model']} (code-cached)"
-            record_request(hit=True, model=model_used,
-                           prompt_tokens=result["usage"]["prompt_tokens"],
-                           completion_tokens=result["usage"]["completion_tokens"])
-        else:
-            result = await _answer_expensive(user_query, tools)
-            model_used = result["model"]
-            record_request(hit=False, model=model_used,
-                           prompt_tokens=result["usage"]["prompt_tokens"],
-                           completion_tokens=result["usage"]["completion_tokens"])
-    else:
-        result = await _answer_expensive(user_query, tools)
-        model_used = result["model"]
-        record_request(hit=False, model=model_used,
-                       prompt_tokens=result["usage"]["prompt_tokens"],
-                       completion_tokens=result["usage"]["completion_tokens"])
-
-    if not is_trivial_hit:
-        content = result["message"]["content"]
-        if content.strip():
-            insert_qa(match_query, content, model_used, purpose="code")
-
-    return result, model_used
+# ── Router (dispatches to classifier / stage / passthrough) ──────
+#
+# The routing logic lives in `router.py` (route_and_answer). `code_proxy.py`
+# keeps only the low-level judge / writer / expensive callers, which `router.py`
+# imports lazily to avoid a circular import at module load time.
 
 
 # ── Non-streaming handler ─────────────────────────────────────────
 
 
 async def handle_code_completion(body: dict) -> dict:
-    user_query, match_query, _messages, _temp, _max_tokens, tools, _ = _extract_query_info(body)
-    result, model_used = await _route_and_respond(user_query, match_query, tools)
+    from router import route_and_answer
+
+    user_query, match_query, messages, _temp, _max_tokens, tools, _ = _extract_query_info(body)
+    session_id = session_id_from(messages, body.get("x_session_id"))
+    result, routing_meta = await route_and_answer(
+        messages, match_query, user_query, tools, session_id, body,
+    )
+    logger.info("routing decision: source=%s rationale=%s",
+                routing_meta["decision_source"], routing_meta["rationale"])
 
     return {
         "id": f"chatcmpl-{int(time.time())}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": model_used,
+        "model": routing_meta["selected_model"],
         "choices": [
             {
                 "index": 0,
@@ -261,6 +285,7 @@ async def handle_code_completion(body: dict) -> dict:
             }
         ],
         "usage": result["usage"],
+        "_routing_meta": routing_meta,
     }
 
 
@@ -268,22 +293,45 @@ async def handle_code_completion(body: dict) -> dict:
 
 
 async def stream_code_completion(body: dict):
-    user_query, match_query, _messages, _temp, _max_tokens, tools, _ = _extract_query_info(body)
+    from router import route_and_answer
+
+    user_query, match_query, messages, _temp, _max_tokens, tools, _ = _extract_query_info(body)
+    session_id = session_id_from(messages, body.get("x_session_id"))
     chat_id = f"chatcmpl-{int(time.time())}"
     created = int(time.time())
 
-    result, model_used = await _route_and_respond(user_query, match_query, tools)
+    result, routing_meta = await route_and_answer(
+        messages, match_query, user_query, tools, session_id, body,
+    )
+    logger.info("routing decision: source=%s rationale=%s",
+                routing_meta["decision_source"], routing_meta["rationale"])
 
-    content = result["message"]["content"] or ""
-    chunk_size = 16
-    for i in range(0, len(content), chunk_size):
+    model_used = routing_meta["selected_model"]
+    msg = result["message"]
+    tool_calls = msg.get("tool_calls")
+
+    if tool_calls:
+        for tc in tool_calls:
+            yield _format_sse(chat_id, created, model_used, {
+                "delta": {"tool_calls": [tc]},
+                "finish_reason": None,
+            })
         yield _format_sse(chat_id, created, model_used, {
-            "delta": {"content": content[i : i + chunk_size]},
-            "finish_reason": None,
+            "delta": {},
+            "finish_reason": "tool_calls",
+            "usage": result["usage"],
         })
-    yield _format_sse(chat_id, created, model_used, {
-        "delta": {},
-        "finish_reason": result["finish_reason"],
-        "usage": result["usage"],
-    })
+    else:
+        content = msg.get("content") or ""
+        chunk_size = 16
+        for i in range(0, len(content), chunk_size):
+            yield _format_sse(chat_id, created, model_used, {
+                "delta": {"content": content[i : i + chunk_size]},
+                "finish_reason": None,
+            })
+        yield _format_sse(chat_id, created, model_used, {
+            "delta": {},
+            "finish_reason": result["finish_reason"],
+            "usage": result["usage"],
+        })
     yield "data: [DONE]\n\n"
