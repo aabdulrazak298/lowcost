@@ -211,6 +211,12 @@ API_KEY = os.getenv("API_KEY", "")
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 
+# ── Agentic cache retrieval (cheap model orchestrates search via tool) ──
+# When enabled, the chat path lets the cheap model resolve implicit wording and
+# query the cache itself via a search_cache tool, instead of the fixed
+# matcher→context-prompt pipeline. Default off (A/B against the matcher).
+AGENTIC_CACHE = os.getenv("AGENTIC_CACHE", "0") == "1"
+
 # ── Code-path routing (Switchyard-inspired) ──
 CODE_ROUTE_MODE = os.getenv("CODE_ROUTE_MODE", "auto")
 SESSION_AFFINITY = os.getenv("SESSION_AFFINITY", "1") == "1"

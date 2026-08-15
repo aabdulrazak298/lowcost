@@ -314,6 +314,29 @@ def edit_image(image_url: str, prompt: str) -> str:
 ALL_TOOLS = [web_search, web_fetch, youtube_transcript, run_code, generate_graph, generate_image, edit_image]
 
 
+@function_tool
+async def search_cache(query: str) -> str:
+    """Search the cache of previously-answered questions for a similar one.
+
+    Returns a JSON object with the cached question and answer, or 'NO MATCH' if
+    nothing similar exists. Use this to check whether a past expert answer can
+    be reused as a foundation for the current question."""
+    import json as _json
+    try:
+        from matcher import smart_cache_lookup
+        match = await smart_cache_lookup(query, purpose="chat")
+    except Exception as e:
+        return f"NO MATCH (error: {type(e).__name__})"
+    if not match:
+        return "NO MATCH"
+    try:
+        from db import increment_hit_count
+        increment_hit_count(match["id"])
+    except Exception:
+        pass
+    return _json.dumps({"question": match["query"], "answer": match["answer"][:1500]})
+
+
 # ── Client factories ──────────────────────────────────────────────
 
 

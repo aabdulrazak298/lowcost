@@ -6,7 +6,7 @@ import datetime as _dt
 import asyncio
 import logging
 import re as _re
-from config import get_cheap_model
+from config import get_cheap_model, AGENTIC_CACHE
 from db import cache_lookup, insert_qa, increment_hit_count
 from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images
 from stats import record_request
@@ -86,6 +86,46 @@ def _is_rejection(answer: str) -> bool:
     return any(p in head for p in _REJECTION_PHRASES)
 
 
+def _is_escalate(answer: str) -> bool:
+    """True if the cheap model asked to escalate (no usable cache match)."""
+    if not answer:
+        return True
+    return answer.strip().upper().startswith("ESCALATE")
+
+
+AGENTIC_CACHE_PROMPT = """You answer the user using a cache of previous expert answers as your knowledge base.
+
+You have a `search_cache` tool. Follow these steps exactly:
+1. Rewrite the user's question into a concrete, specific question. Resolve any vague or implicit wording (like "the first one" or "that thing") using the conversation context.
+2. Call search_cache with that question.
+3. If the tool returns a RELATED cached question+answer, use it as your FOUNDATION — not a constraint — and expand or adapt it to fully answer the user. Augment with anything you know. Do NOT mention the cache, "expert", or say "based on".
+4. If the tool returns NO MATCH or an answer about a DIFFERENT topic, do NOT answer the question — reply with exactly one word and nothing else:
+
+ESCALATE"""
+
+
+async def _agentic_cache_flow(user_query: str, chat_history: str) -> tuple[bool, str]:
+    """Cheap model orchestrates cache retrieval via the search_cache tool.
+
+    Returns (is_escalate, answer). When is_escalate is True, answer is ''.
+    """
+    from llm import search_cache
+
+    messages = [
+        {"role": "system", "content": f"{AGENTIC_CACHE_PROMPT}\n\n{_DATE_CONTEXT}"},
+    ]
+    if chat_history:
+        messages.append({
+            "role": "system",
+            "content": f"Previous conversation:\n{chat_history[-2000:]}",
+        })
+    messages.append({"role": "user", "content": user_query})
+    answer = await call_cheap(messages, tools=[search_cache])
+    if _is_escalate(answer):
+        return True, ""
+    return False, answer
+
+
 async def process_query(
     user_query: str,
     chat_history: str = "",
@@ -116,37 +156,44 @@ async def process_query(
     # Use last 3 user messages for matching; if only 1, use just the current query
     match_query = " ".join(user_lines[-3:])
 
-    match = await cache_lookup(match_query)
-
-    if match:
-        # --- TRY CHEAP PATH ---
-        context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
-            expert_answer=match["answer"],
-            user_query=user_query,
-        )
-        messages = [
-            {
-                "role": "system",
-                "content": f"You are a helpful assistant. {_DATE_CONTEXT} Answer accurately using the provided expert reference.",
-            },
-        ]
-        if chat_history:
-            messages.append({
-                "role": "system",
-                "content": f"Previous conversation:\n{chat_history[-2000:]}",
-            })
-        messages.append({"role": "user", "content": context_prompt})
-        answer = await call_cheap(messages, tools=None)  # tools enabled, max 10 rounds
-
-        # Self-check: did the cheap model reject the cached answer?
-        if _is_rejection(answer):
-            record_request(hit=False, model="irrelevant-escalated")
-            match = None  # force expensive path below
-        else:
-            increment_hit_count(match["id"])
-            model_used = f"{get_cheap_model()} (cached)"
+    if AGENTIC_CACHE:
+        # New: cheap model orchestrates cache retrieval via the search_cache tool.
+        is_escalate, answer = await _agentic_cache_flow(user_query, chat_history)
+        if not is_escalate:
+            model_used = f"{get_cheap_model()} (agentic-cached)"
             record_request(hit=True, model=model_used)
             return answer, model_used, _get_generated_images()
+    else:
+        match = await cache_lookup(match_query)
+
+        if match:
+            # --- TRY CHEAP PATH ---
+            context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
+                expert_answer=match["answer"],
+                user_query=user_query,
+            )
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"You are a helpful assistant. {_DATE_CONTEXT} Answer accurately using the provided expert reference.",
+                },
+            ]
+            if chat_history:
+                messages.append({
+                    "role": "system",
+                    "content": f"Previous conversation:\n{chat_history[-2000:]}",
+                })
+            messages.append({"role": "user", "content": context_prompt})
+            answer = await call_cheap(messages, tools=None)  # tools enabled, max 10 rounds
+
+            # Self-check: did the cheap model reject the cached answer?
+            if _is_rejection(answer):
+                record_request(hit=False, model="irrelevant-escalated")
+            else:
+                increment_hit_count(match["id"])
+                model_used = f"{get_cheap_model()} (cached)"
+                record_request(hit=True, model=model_used)
+                return answer, model_used, _get_generated_images()
 
     # --- EXPENSIVE PATH ---
     messages = [
@@ -192,31 +239,41 @@ async def process_query_stream(
     user_lines.append(user_query)
     match_query = " ".join(user_lines[-3:])
 
-    match = await cache_lookup(match_query)
-
-    if match:
-        context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
-            expert_answer=match["answer"],
-            user_query=user_query,
-        )
-        messages = [{"role": "system", "content": f"You are a helpful assistant. {_DATE_CONTEXT} Answer accurately using the provided expert reference."}]
-        if chat_history:
-            messages.append({"role": "system", "content": f"Previous conversation:\n{chat_history[-2000:]}"})
-        messages.append({"role": "user", "content": context_prompt})
-        answer = await call_cheap(messages, tools=None)  # tools enabled, max 10 rounds
-
-        if _is_rejection(answer):
-            record_request(hit=False, model="irrelevant-escalated")
-            match = None
-        else:
-            increment_hit_count(match["id"])
-            model_used = f"{get_cheap_model()} (cached)"
+    if AGENTIC_CACHE:
+        is_escalate, answer = await _agentic_cache_flow(user_query, chat_history)
+        if not is_escalate:
+            model_used = f"{get_cheap_model()} (agentic-cached)"
             record_request(hit=True, model=model_used)
             if asyncio.iscoroutinefunction(callback):
                 await callback(answer)
             else:
                 callback(answer)
             return model_used, _get_generated_images()
+    else:
+        match = await cache_lookup(match_query)
+
+        if match:
+            context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
+                expert_answer=match["answer"],
+                user_query=user_query,
+            )
+            messages = [{"role": "system", "content": f"You are a helpful assistant. {_DATE_CONTEXT} Answer accurately using the provided expert reference."}]
+            if chat_history:
+                messages.append({"role": "system", "content": f"Previous conversation:\n{chat_history[-2000:]}"})
+            messages.append({"role": "user", "content": context_prompt})
+            answer = await call_cheap(messages, tools=None)  # tools enabled, max 10 rounds
+
+            if _is_rejection(answer):
+                record_request(hit=False, model="irrelevant-escalated")
+            else:
+                increment_hit_count(match["id"])
+                model_used = f"{get_cheap_model()} (cached)"
+                record_request(hit=True, model=model_used)
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(answer)
+                else:
+                    callback(answer)
+                return model_used, _get_generated_images()
 
     # Expensive path with streaming
     messages = [{"role": "system", "content": _DATE_CONTEXT}]
