@@ -308,7 +308,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Bind delivery target so image tools can self-deliver via sendPhoto
         set_delivery_context("telegram", chat_id, TELEGRAM_BOT_TOKEN)
         try:
-            response, model_used, _images = await process_query(
+            response, model_used, _images, usage = await process_query(
                 user_query=user_msg,
                 chat_history=history[-10:],
             )
@@ -330,37 +330,10 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         history = history[-20:]
     context.user_data["history"] = history
 
-    # Build calling card with short model name and REAL cost
-    from config import AVAILABLE_MODELS, MODEL_PRICING
-    from llm import get_last_usage, _reset_usage
+    # Build calling card with short model name and REAL cost (shared helper)
+    from config import build_calling_card
 
-    # Get real token usage from the LLM call
-    usage = get_last_usage()
-    _reset_usage()
-
-    # Shorten model name
-    short_name = model_used
-    for key, (full_id, _) in AVAILABLE_MODELS.items():
-        if full_id in model_used:
-            short_name = f"{key} (cached)" if "(cached)" in model_used else key
-            break
-
-    # Calculate real cost from actual tokens
-    prompt_tokens = usage.get("prompt_tokens", 0)
-    completion_tokens = usage.get("completion_tokens", 0)
-    if prompt_tokens or completion_tokens:
-        # Find pricing for this model
-        price_per_m = 0.28  # default
-        for key, (full_id, _) in AVAILABLE_MODELS.items():
-            if full_id in model_used:
-                price_per_m = MODEL_PRICING.get(key, 0.28)
-                break
-        total_tokens = prompt_tokens + completion_tokens
-        cost = (total_tokens / 1_000_000) * price_per_m
-        cost_str = f" · ${cost:.6f} · {total_tokens} tok"
-    else:
-        cost_str = ""
-    footer = f"\n\n---\n🤖 {short_name}{cost_str}"
+    footer = build_calling_card(model_used, usage)
     full_response = response + footer
 
     # Send — voice bubble + hidden transcript if voice mode is ON

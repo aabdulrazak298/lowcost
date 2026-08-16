@@ -49,6 +49,23 @@ def _reset_usage() -> None:
     _last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "model": ""}
 
 
+def _extract_usage(result, model_id: str) -> dict:
+    """Sum token usage across a run's raw responses (SDK 0.20.0).
+
+    RunResult no longer exposes a top-level .usage; usage lives on each
+    ModelResponse in result.raw_responses (one per turn, so a multi-turn
+    tool loop sums to the full run cost).
+    """
+    prompt = 0
+    completion = 0
+    for resp in getattr(result, "raw_responses", None) or []:
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            prompt += getattr(u, "input_tokens", 0) or 0
+            completion += getattr(u, "output_tokens", 0) or 0
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "model": model_id}
+
+
 # ── Image delivery context ────────────────────────────────────────
 #
 # The image tools are generic — they don't know which platform/chat asked.
@@ -438,14 +455,10 @@ async def call_cheap(
 
         result = await Runner.run(agent, input=input_text, max_turns=30)
 
-        # Track usage
-        if result and hasattr(result, "usage"):
+        # Track usage (SDK 0.20.0: usage on raw ModelResponses, not RunResult)
+        if result:
             global _last_usage
-            _last_usage = {
-                "prompt_tokens": getattr(result.usage, "input_tokens", 0),
-                "completion_tokens": getattr(result.usage, "output_tokens", 0),
-                "model": model_id,
-            }
+            _last_usage = _extract_usage(result, model_id)
 
         return result.final_output if result else "(no response)"
 
@@ -528,14 +541,10 @@ async def _call_expensive_with_client(
 
     result = await Runner.run(agent, input=input_text, max_turns=30)
 
-    # Track usage
-    if result and hasattr(result, "usage"):
+    # Track usage (SDK 0.20.0: usage on raw ModelResponses, not RunResult)
+    if result:
         global _last_usage
-        _last_usage = {
-            "prompt_tokens": getattr(result.usage, "input_tokens", 0),
-            "completion_tokens": getattr(result.usage, "output_tokens", 0),
-            "model": model_id,
-        }
+        _last_usage = _extract_usage(result, model_id)
 
     return result.final_output if result else "(no response)"
 

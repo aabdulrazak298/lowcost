@@ -9,6 +9,7 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from processor import process_query
+from config import build_calling_card
 from llm import set_delivery_context, clear_delivery_context
 
 
@@ -51,19 +52,21 @@ async def handle_webhook_chat(request: Request):
     result_answer = None
     result_model = None
     result_images = []
+    result_footer = ""
     _exception = None
 
     async def _process():
-        nonlocal result_answer, result_model, result_images, _exception
+        nonlocal result_answer, result_model, result_images, result_footer, _exception
         try:
             set_delivery_context("web")
             try:
-                answer, model_used, _images = await process_query(user_query, chat_history)
+                answer, model_used, _images, usage = await process_query(user_query, chat_history)
             finally:
                 clear_delivery_context()
             result_answer = answer
             result_model = model_used
             result_images = _images or []
+            result_footer = build_calling_card(model_used, usage)
         except Exception as e:
             _exception = e
 
@@ -114,6 +117,14 @@ async def handle_webhook_chat(request: Request):
             yield await _stream_json_line({
                 "type": "item",
                 "content": f"\n\n![Generated image]({url})\n",
+                "metadata": {},
+            })
+
+        # Calling card — model + real token cost, matching the Telegram footer
+        if result_footer:
+            yield await _stream_json_line({
+                "type": "item",
+                "content": result_footer,
                 "metadata": {},
             })
 

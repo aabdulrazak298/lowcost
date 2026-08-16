@@ -10,7 +10,7 @@ import re as _re
 import urllib.request
 from config import get_cheap_model, AGENTIC_CACHE
 from db import cache_lookup, insert_qa, increment_hit_count
-from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images
+from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images, get_last_usage
 from stats import record_request
 from curator import run_curator
 
@@ -317,7 +317,7 @@ async def process_query(
     user_query: str,
     chat_history: str = "",
     system_prompt: str | None = None,
-) -> tuple[str, str, list[str]]:
+) -> tuple[str, str, list[str], dict]:
     """Process a user query through the two-tier cache → cheap → expensive pipeline.
 
     Args:
@@ -326,7 +326,7 @@ async def process_query(
         system_prompt: Optional override system prompt for expensive path.
 
     Returns:
-        (answer_text, model_used_label, generated_image_paths)
+        (answer_text, model_used_label, generated_image_paths, usage_dict)
     """
     # Clear any images from a previous request
     _clear_generated_images()
@@ -338,10 +338,11 @@ async def process_query(
     if AGENTIC_CACHE:
         # Dormant: cheap model orchestrates cache retrieval via search_cache tool.
         is_escalate, answer = await _agentic_cache_flow(user_query, turns_to_string(turns))
+        usage = get_last_usage()
         if not is_escalate:
             model_used = f"{get_cheap_model()} (agentic-cached)"
             record_request(hit=True, model=model_used)
-            return answer, model_used, _get_generated_images()
+            return answer, model_used, _get_generated_images(), usage
         match = None
     else:
         # Referential follow-up ("number 5")? Its meaning lives in the thread,
@@ -383,6 +384,7 @@ async def process_query(
             f"{user_query}"
         )})
         answer = await call_cheap(messages, tools=None, reasoning=True)
+        usage = get_last_usage()
 
         # Self-check: did the cheap model reject the cached answer?
         if _is_rejection(answer):
@@ -392,7 +394,7 @@ async def process_query(
             increment_hit_count(match["id"])
             model_used = f"{get_cheap_model()} (cached)"
             record_request(hit=True, model=model_used)
-            return answer, model_used, _get_generated_images()
+            return answer, model_used, _get_generated_images(), usage
 
     # --- EXPENSIVE PATH: history replayed as turns, no cache blob ---
     messages = [{"role": "system", "content": _DATE_CONTEXT}]
@@ -401,6 +403,7 @@ async def process_query(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_query})
     answer, model_used = await call_expensive(messages)
+    usage = get_last_usage()
     insert_qa(user_query, answer, model_used)
     record_request(hit=False, model=model_used)
 
@@ -409,7 +412,7 @@ async def process_query(
     if rejected_match is not None:
         await run_curator(rejected_match)
 
-    return answer, model_used, _get_generated_images()
+    return answer, model_used, _get_generated_images(), usage
 
 
 async def process_query_stream(

@@ -124,6 +124,37 @@ def estimate_cost(model_id: str, output_chars: int) -> float:
     return 0.0
 
 
+def build_calling_card(model_used: str, usage: dict | None = None) -> str:
+    """Build the '🤖 <short-key> · $<cost>' footer shown after an answer.
+
+    Single source of truth for the Telegram + web calling card, so both
+    platforms show the identical model label and real token cost.
+    """
+    usage = usage or {}
+
+    # Shorten model id to its registry key ("qwen/qwen3.7-flash" -> "qwen").
+    short_name = model_used
+    for key, (full_id, _) in AVAILABLE_MODELS.items():
+        if full_id in model_used:
+            short_name = f"{key} (cached)" if "(cached)" in model_used else key
+            break
+
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    if prompt_tokens or completion_tokens:
+        price_per_m = 0.28  # default
+        for key, (full_id, _) in AVAILABLE_MODELS.items():
+            if full_id in model_used:
+                price_per_m = MODEL_PRICING.get(key, 0.28)
+                break
+        total_tokens = prompt_tokens + completion_tokens
+        cost = (total_tokens / 1_000_000) * price_per_m
+        cost_str = f" · ${cost:.6f} · {total_tokens} tok"
+    else:
+        cost_str = ""
+    return f"\n\n---\n🤖 {short_name}{cost_str}"
+
+
 # Telegram bot
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ALLOWED_USERS = os.getenv("TELEGRAM_ALLOWED_USERS", "")
