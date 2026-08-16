@@ -66,6 +66,11 @@ def init_db() -> None:
         ON qa_cache(created_at DESC)
     """)
 
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_qa_last_accessed
+        ON qa_cache(last_accessed)
+    """)
+
     # FTS5 full-text index for fast candidate pre-filtering
     conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS qa_cache_fts USING fts5(
@@ -146,7 +151,7 @@ def _init_conversations_table(conn: sqlite3.Connection) -> None:
 
 
 def insert_qa(query: str, answer: str, model_used: str, purpose: str = "chat") -> int:
-    """Insert a Q&A pair. Evicts oldest if over max. Returns the new row ID."""
+    """Insert a Q&A pair. Evicts least-recently-accessed if over max. Returns the new row ID."""
     conn = get_conn()
     cur = conn.execute(
         "INSERT INTO qa_cache (query, answer, model_used, purpose, last_accessed) "
@@ -160,7 +165,7 @@ def insert_qa(query: str, answer: str, model_used: str, purpose: str = "chat") -
         excess = count - CACHE_MAX_ENTRIES
         conn.execute(
             "DELETE FROM qa_cache WHERE id IN "
-            "(SELECT id FROM qa_cache ORDER BY created_at ASC LIMIT ?)",
+            "(SELECT id FROM qa_cache ORDER BY last_accessed ASC LIMIT ?)",
             (excess,),
         )
     conn.commit()
