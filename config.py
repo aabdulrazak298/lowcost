@@ -93,7 +93,6 @@ AVAILABLE_MODELS = {
     "flash":      ("deepseek/deepseek-v4-flash", "OpenRouter"),
     "flash-ds":   ("deepseek-v4-flash", "DeepSeek Direct"),
     "pro":        ("deepseek-v4-pro", "DeepSeek Direct"),
-    "r1":         ("deepseek-reasoner", "DeepSeek Direct"),
     "m3":         ("minimax/minimax-m3", "OpenRouter"),
     "gemini":     ("google/gemini-2.5-flash", "OpenRouter"),
     "gemini-lite":("google/gemini-3.1-flash-lite", "OpenRouter"),
@@ -109,7 +108,7 @@ AVAILABLE_MODELS = {
 MODEL_PRICING: dict[str, float] = {
     "qwen": 0.13, "qwen36": 0.26, "qwen35f": 0.26, "qwen35b": 0.80,
     "qwen-plus": 1.28, "flash": 0.28, "flash-ds": 0.28, "pro": 0.87,
-    "r1": 2.19, "m3": 2.40, "gemini": 2.50, "gemini-lite": 1.50,
+    "m3": 2.40, "gemini": 2.50, "gemini-lite": 1.50,
     "llama": 0.85, "luna": 6.00, "ling": 0.021, "sonnet": 15.00, "nemotron": 2.20, "solar": 0.12,
 }
 
