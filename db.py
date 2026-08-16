@@ -234,6 +234,35 @@ def get_all_queries() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def lookup_by_video_id(video_id: str, purpose: str = "chat") -> dict | None:
+    """Return the most recent cached entry whose query contains this exact video ID.
+
+    Used by the agentic cache search for same-video reuse: an exact 11-char
+    YouTube ID is the true identity of a video, so a substring match is safe.
+    """
+    conn = get_conn()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=CACHE_TTL_DAYS)).isoformat()
+    row = conn.execute(
+        "SELECT id, query, answer, model_used, hit_count, created_at "
+        "FROM qa_cache "
+        "WHERE query LIKE ? AND created_at >= ? AND purpose = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (f"%{video_id}%", cutoff, purpose),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_cache_entry(cache_id: int) -> int:
+    """Delete a cached Q&A row by id. FTS is kept in sync via the delete trigger.
+
+    Returns the number of rows deleted (0 if the id no longer exists).
+    """
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM qa_cache WHERE id = ?", (cache_id,))
+    conn.commit()
+    return cur.rowcount
+
+
 def increment_hit_count(cache_id: int) -> None:
     conn = get_conn()
     conn.execute(

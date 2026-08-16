@@ -18,7 +18,7 @@ from pathlib import Path
 
 import httpx
 from openai import AsyncOpenAI
-from agents import Agent, Runner, function_tool, OpenAIChatCompletionsModel, set_tracing_disabled
+from agents import Agent, Runner, function_tool, OpenAIChatCompletionsModel, set_tracing_disabled, ModelSettings
 
 from config import (
     CHEAP_API_KEY,
@@ -370,10 +370,14 @@ async def call_cheap(
     temperature: float = 0.7,
     max_tokens: int = 8192,
     tools: list | None = None,
+    reasoning: bool = False,
 ) -> str:
     """Call cheap model via OpenRouter with optional tool calling.
 
     Uses OpenAI Agents SDK — provider routing handled automatically.
+    reasoning=True enables model thinking (OpenRouter `reasoning.enabled`), which
+    qwen3.7-flash needs to emit structured tool calls (otherwise it writes code
+    as plain text). Only set it on the answer path, NOT the search-key path.
     """
     client = _build_cheap_client()
     model_id = get_cheap_model()
@@ -414,12 +418,17 @@ async def call_cheap(
             system_prompt = instructions
             user_messages = [{"role": "user", "content": user_query_line or user_messages[0]["content"]}]
 
-    agent = Agent(
+    agent_kwargs = dict(
         name="LowCostLLM-Cheap",
         instructions=system_prompt.strip() or "You are a helpful assistant. Use web_search to find current information whenever needed.",
         tools=use_tools,
         model=sdk_model,
     )
+    if reasoning:
+        # OpenRouter reasoning control via SDK ModelSettings.extra_body (merged to
+        # top-level "reasoning" in the HTTP body — NOT an "extra_body" field).
+        agent_kwargs["model_settings"] = ModelSettings(extra_body={"reasoning": {"enabled": True}})
+    agent = Agent(**agent_kwargs)
 
     try:
         # Convert messages to input string
@@ -529,6 +538,35 @@ async def _call_expensive_with_client(
         }
 
     return result.final_output if result else "(no response)"
+
+
+async def call_curator_verdict(cached_question: str, cached_answer: str) -> str:
+    """Ask the expensive model to judge a rejected cache entry (EVICT/KEEP).
+
+    No tools, single turn, plain text — a cheap verdict, not a full answer.
+    Routes like call_expensive: OpenRouter IDs ("org/model") go via the OR
+    client, native DeepSeek IDs via the direct client.
+    """
+    from curator import build_curator_messages
+
+    model_id = get_expensive_model()
+    is_or = "/" in model_id
+    client = _build_cheap_client() if is_or else _build_expensive_client()
+
+    msgs = build_curator_messages(cached_question, cached_answer)
+    sdk_model = OpenAIChatCompletionsModel(model=model_id, openai_client=client)
+    agent = Agent(
+        name="CacheCurator",
+        instructions=msgs[0]["content"],
+        tools=[],
+        model=sdk_model,
+    )
+    try:
+        result = await Runner.run(agent, input=msgs[1]["content"], max_turns=1)
+        return result.final_output if result else ""
+    except Exception as e:
+        logger.warning(f"Curator verdict call failed: {e}")
+        return ""
 
 
 async def call_expensive_stream(

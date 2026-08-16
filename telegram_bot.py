@@ -300,12 +300,8 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text("⛔ Access denied.")
             return
 
-    # Build chat history from user_data
+    # Build chat history from user_data (list of {role, content} turns)
     history = context.user_data.get("history", [])
-    chat_history_str = "\n".join(
-        f"{'User' if h['role'] == 'user' else 'Assistant'}: {h['content']}"
-        for h in history[-10:]
-    )
 
     # Process through the shared pipeline
     try:
@@ -314,7 +310,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             response, model_used, _images = await process_query(
                 user_query=user_msg,
-                chat_history=chat_history_str,
+                chat_history=history[-10:],
             )
         finally:
             clear_delivery_context()
