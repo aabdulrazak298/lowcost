@@ -208,10 +208,30 @@ def youtube_transcript(video_url: str) -> str:
         "=" * 60,
     ]
 
-    for seg in transcript[:200]:  # cap at 200 segments to avoid token overflow
+    # Character budget (~120k chars ≈ 30k tokens). The old 200-segment cap
+    # truncated ~15-25 min videos; modern contexts hold far more, so only
+    # very long videos (~2h+) hit this. Report truncation honestly so the
+    # model doesn't pretend it saw the whole thing.
+    _MAX_CHARS = 120_000
+    total = 0
+    shown = 0
+    for seg in transcript:
         s = int(seg["start"])
         ts = f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-        lines.append(f"[{ts}] {seg['text']}")
+        line = f"[{ts}] {seg['text']}"
+        if total + len(line) + 1 > _MAX_CHARS:
+            break
+        lines.append(line)
+        total += len(line) + 1
+        shown += 1
+
+    if shown < len(transcript):
+        shown_min = int(meta.get("duration", 0) * shown / max(len(transcript), 1)) // 60
+        total_min = int(meta.get("duration", 0)) // 60
+        lines.append(
+            f"\n[Transcript truncated: {shown} of {len(transcript)} segments "
+            f"(~{shown_min} of {total_min} min shown).]"
+        )
 
     return "\n".join(lines)
 
