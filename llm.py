@@ -208,11 +208,11 @@ def youtube_transcript(video_url: str) -> str:
         "=" * 60,
     ]
 
-    # Character budget (~120k chars ≈ 30k tokens). The old 200-segment cap
-    # truncated ~15-25 min videos; modern contexts hold far more, so only
-    # very long videos (~2h+) hit this. Report truncation honestly so the
+    # Character budget (~400k chars ≈ 100k tokens). The old 200-segment cap
+    # truncated ~15-25 min videos; qwen3.7-flash has a 1M-token context, so
+    # ~8h of video fits in a single pass. Report truncation honestly so the
     # model doesn't pretend it saw the whole thing.
-    _MAX_CHARS = 120_000
+    _MAX_CHARS = 400_000
     total = 0
     shown = 0
     for seg in transcript:
