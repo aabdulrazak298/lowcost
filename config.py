@@ -12,10 +12,10 @@ SIMILARITY_THRESHOLD = int(os.getenv("SIMILARITY_THRESHOLD", "48"))
 CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "365"))
 CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "2000000"))  # ~4 GB
 
-# Cheap model (configurable — currently DeepSeek V4 Flash via OpenRouter)
+# Cheap model (configurable — currently Qwen 3.7 Flash via OpenRouter)
 CHEAP_API_KEY = os.getenv("CHEAP_API_KEY", "")
 CHEAP_BASE_URL = os.getenv("CHEAP_BASE_URL", "https://openrouter.ai/api/v1")
-CHEAP_MODEL = os.getenv("CHEAP_MODEL", "deepseek-v4-flash")
+CHEAP_MODEL = os.getenv("CHEAP_MODEL", "qwen/qwen3.7-flash")
 
 # Expensive model — DeepSeek V4 Pro direct API (native tool calling)
 EXPENSIVE_API_KEY = os.getenv("EXPENSIVE_API_KEY", "")
