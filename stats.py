@@ -5,6 +5,7 @@ The code path (judge/router) records with `purpose="code"` so its metrics are
 tracked separately from general chat.
 """
 import threading
+from collections import deque
 from datetime import datetime, timezone
 
 
@@ -36,6 +37,9 @@ def _make_stats() -> dict:
 
 _stats = _make_stats()       # chat
 _code_stats = _make_stats()  # code
+
+# Rolling buffer of recent cache-hit rejections (chat path) for inspection.
+_recent_irrelevant: deque = deque(maxlen=25)
 
 _save_count = 0
 
@@ -89,6 +93,17 @@ def record_request(
         _flush_db()
 
 
+def record_irrelevant_escalation(query: str, cached_query: str, rejection: str) -> None:
+    """Record a cache-hit rejection for inspection (query + wrong-topic example + reason)."""
+    with _lock:
+        _recent_irrelevant.appendleft({
+            "query": (query or "")[:200],
+            "cached_query": (cached_query or "")[:200],
+            "rejection": (rejection or "")[:200],
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
+
 def _flush_db() -> None:
     """Write current stats to SQLite."""
     from db import save_stats
@@ -131,7 +146,9 @@ def _snapshot(target: dict) -> dict:
 def get_stats() -> dict:
     """Return current chat statistics snapshot."""
     with _lock:
-        return _snapshot(_stats)
+        snap = _snapshot(_stats)
+        snap["recent_irrelevant"] = list(_recent_irrelevant)
+        return snap
 
 
 def get_code_stats() -> dict:

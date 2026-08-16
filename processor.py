@@ -11,7 +11,7 @@ import urllib.request
 from config import get_cheap_model, AGENTIC_CACHE
 from db import cache_lookup, insert_qa, increment_hit_count
 from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images, get_last_usage
-from stats import record_request
+from stats import record_request, record_irrelevant_escalation
 from curator import run_curator
 
 logger = logging.getLogger(__name__)
@@ -390,6 +390,11 @@ async def process_query(
         if _is_rejection(answer):
             rejected_match = match
             record_request(hit=False, model="irrelevant-escalated")
+            logger.info(
+                "irrelevant-escalated: query=%r cached=%r rejection=%r",
+                user_query[:120], match["query"][:120], answer[:120],
+            )
+            record_irrelevant_escalation(user_query, match["query"], answer)
         else:
             increment_hit_count(match["id"])
             model_used = f"{get_cheap_model()} (cached)"
@@ -483,6 +488,11 @@ async def process_query_stream(
         if _is_rejection(answer):
             rejected_match = match
             record_request(hit=False, model="irrelevant-escalated")
+            logger.info(
+                "irrelevant-escalated: query=%r cached=%r rejection=%r",
+                user_query[:120], match["query"][:120], answer[:120],
+            )
+            record_irrelevant_escalation(user_query, match["query"], answer)
         else:
             increment_hit_count(match["id"])
             model_used = f"{get_cheap_model()} (cached)"
