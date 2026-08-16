@@ -37,7 +37,8 @@ def init_db() -> None:
             answer      TEXT    NOT NULL,
             model_used  TEXT    NOT NULL,
             hit_count   INTEGER NOT NULL DEFAULT 0,
-            created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            last_accessed TEXT  NOT NULL DEFAULT (datetime('now'))
         )
     """)
     # Migration: add hit_count column if upgrading from older schema
@@ -50,6 +51,15 @@ def init_db() -> None:
         conn.execute("ALTER TABLE qa_cache ADD COLUMN purpose TEXT NOT NULL DEFAULT 'chat'")
     except Exception:
         pass
+    # Migration: add last_accessed column (sliding TTL — refreshed on hit).
+    # SQLite ALTER ADD COLUMN can't carry a datetime('now') default, so add a
+    # nullable column and backfill existing rows from created_at.
+    try:
+        conn.execute("ALTER TABLE qa_cache ADD COLUMN last_accessed TEXT")
+    except Exception:
+        pass
+    conn.execute("UPDATE qa_cache SET last_accessed = created_at WHERE last_accessed IS NULL")
+    conn.commit()
 
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_qa_created
@@ -139,7 +149,8 @@ def insert_qa(query: str, answer: str, model_used: str, purpose: str = "chat") -
     """Insert a Q&A pair. Evicts oldest if over max. Returns the new row ID."""
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO qa_cache (query, answer, model_used, purpose) VALUES (?, ?, ?, ?)",
+        "INSERT INTO qa_cache (query, answer, model_used, purpose, last_accessed) "
+        "VALUES (?, ?, ?, ?, datetime('now'))",
         (query, answer, model_used, purpose),
     )
     rid = cur.lastrowid
@@ -213,7 +224,7 @@ def search_candidates(query: str, limit: int = 100, purpose: str = "chat") -> li
         "       bm25(qa_cache_fts) AS rank "
         "FROM qa_cache_fts fts "
         "JOIN qa_cache qa ON fts.rowid = qa.id "
-        "WHERE qa_cache_fts MATCH ? AND qa.created_at >= ? AND qa.purpose = ? "
+        "WHERE qa_cache_fts MATCH ? AND qa.last_accessed >= ? AND qa.purpose = ? "
         "ORDER BY rank LIMIT ?",
         (fts_query, cutoff, purpose, limit),
     ).fetchall()
@@ -227,7 +238,7 @@ def get_all_queries() -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
         "SELECT id, query, answer, model_used, hit_count, created_at "
-        "FROM qa_cache WHERE created_at >= ? "
+        "FROM qa_cache WHERE last_accessed >= ? "
         "ORDER BY created_at DESC",
         (cutoff,),
     ).fetchall()
@@ -245,7 +256,7 @@ def lookup_by_video_id(video_id: str, purpose: str = "chat") -> dict | None:
     row = conn.execute(
         "SELECT id, query, answer, model_used, hit_count, created_at "
         "FROM qa_cache "
-        "WHERE query LIKE ? AND created_at >= ? AND purpose = ? "
+        "WHERE query LIKE ? AND last_accessed >= ? AND purpose = ? "
         "ORDER BY created_at DESC LIMIT 1",
         (f"%{video_id}%", cutoff, purpose),
     ).fetchone()
@@ -266,7 +277,8 @@ def delete_cache_entry(cache_id: int) -> int:
 def increment_hit_count(cache_id: int) -> None:
     conn = get_conn()
     conn.execute(
-        "UPDATE qa_cache SET hit_count = hit_count + 1 WHERE id = ?",
+        "UPDATE qa_cache SET hit_count = hit_count + 1, "
+        "last_accessed = datetime('now') WHERE id = ?",
         (cache_id,),
     )
     conn.commit()
@@ -278,12 +290,12 @@ def get_cache_stats() -> dict:
     total = conn.execute("SELECT COUNT(*) FROM qa_cache").fetchone()[0]
     cutoff = (datetime.now(timezone.utc) - timedelta(days=CACHE_TTL_DAYS)).isoformat()
     active = conn.execute(
-        "SELECT COUNT(*) FROM qa_cache WHERE created_at >= ?", (cutoff,)
+        "SELECT COUNT(*) FROM qa_cache WHERE last_accessed >= ?", (cutoff,)
     ).fetchone()[0]
     expired = total - active
     top = conn.execute(
         "SELECT query, hit_count FROM qa_cache "
-        "WHERE created_at >= ? "
+        "WHERE last_accessed >= ? "
         "ORDER BY hit_count DESC LIMIT 5",
         (cutoff,),
     ).fetchall()
