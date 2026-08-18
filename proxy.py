@@ -11,6 +11,7 @@ from llm import (
     call_cheap_full,
     call_expensive_full,
     stream_expensive_full,
+    get_last_usage,
 )
 from stats import record_request
 from processor import _is_rejection
@@ -114,10 +115,12 @@ async def handle_chat_completion(body: dict) -> dict:
             )
         else:
             text = await call_cheap(cheap_messages, temperature, max_tokens)
+            # Report the model that ACTUALLY answered — fallback may have fired.
+            used = get_last_usage().get("model") or get_cheap_model()
             result = {
                 "content": text,
                 "tool_calls": None,
-                "model": f"{get_cheap_model()} (cached)",
+                "model": f"{used} (cached)",
                 "usage": None,
                 "finish_reason": "stop",
             }

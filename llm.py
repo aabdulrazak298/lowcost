@@ -15,6 +15,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
@@ -23,9 +24,16 @@ from agents import Agent, Runner, function_tool, OpenAIChatCompletionsModel, set
 from config import (
     CHEAP_API_KEY,
     CHEAP_BASE_URL,
+    CHEAP_FALLBACK_MODEL,
+    CHEAP_FALLBACK_RETRIES,
     EXPENSIVE_API_KEY,
     EXPENSIVE_BASE_URL,
+    ENGY_API_KEY,
+    ENGY_BASE_URL,
+    ENGY_MODELS,
+    ENGY_FALLBACK_MODEL,
     get_cheap_model,
+    get_cheap_fallback_model,
     get_expensive_model,
 )
 from stats import record_request
@@ -260,7 +268,12 @@ def run_code(code: str) -> str:
 
 @function_tool
 def generate_graph(x: list, y: list, chart_type: str = "line", title: str = "") -> str:
-    """Generate a chart/graph from data. chart_type: line, bar, scatter, pie."""
+    """Generate a chart/graph from data.
+
+    chart_type: line, bar, scatter, histogram, pie.
+    x can be numeric values OR string category labels (e.g. ["Jan","Feb","Mar"]).
+    y must be numeric values. For pie, x = slice labels and y = slice values.
+    """
     try:
         import base64
         payload = {"data": {"x": x, "y": y}, "graph_type": chart_type}
@@ -399,25 +412,59 @@ def _build_expensive_client() -> AsyncOpenAI:
     )
 
 
+def _build_engy_client() -> AsyncOpenAI:
+    """Engy client — decentralized verified inference (Bittensor SN53)."""
+    return AsyncOpenAI(
+        base_url=ENGY_BASE_URL,
+        api_key=ENGY_API_KEY,
+        max_retries=1, timeout=httpx.Timeout(connect=5.0, read=180.0, write=120.0, pool=5.0),
+    )
+
+
+def _client_for_model(model_id: str) -> AsyncOpenAI:
+    """Resolve the correct upstream client for a model id.
+
+    Engy-served ids -> Engy client; OpenRouter-style ids ("org/model") -> cheap
+    (OpenRouter) client; native DeepSeek ids -> direct DeepSeek client.
+    """
+    if model_id in ENGY_MODELS:
+        return _build_engy_client()
+    if "/" in model_id:
+        return _build_cheap_client()
+    return _build_expensive_client()
+
+
+def _reasoning_settings(model_id: str, force_reasoning: bool = False) -> ModelSettings | None:
+    """Per-provider thinking settings (returns None = rely on provider default).
+
+    - Engy: thinking is OFF by default, so always enable it via reasoning_effort
+      to match DeepSeek direct's default-thinking flash. (Engy ignores the
+      OpenRouter reasoning.enabled flag.)
+    - OpenRouter: only when force_reasoning — qwen3.7-flash needs reasoning.enabled
+      to emit structured tool calls, and only the answer path forces it.
+    - DeepSeek direct: never needed — thinking already ON by default.
+    """
+    if model_id in ENGY_MODELS:
+        return ModelSettings(extra_body={"reasoning_effort": "high"})
+    if "/" in model_id and force_reasoning:
+        return ModelSettings(extra_body={"reasoning": {"enabled": True}})
+    return None
+
+
 # ── Agent wrappers ────────────────────────────────────────────────
 
 
-async def call_cheap(
+async def _run_cheap_agent(
+    model_id: str,
     messages: list[dict],
-    temperature: float = 0.7,
-    max_tokens: int = 8192,
-    tools: list | None = None,
-    reasoning: bool = False,
+    temperature: float,
+    max_tokens: int,
+    tools: list | None,
+    reasoning: bool,
 ) -> str:
-    """Call cheap model via OpenRouter with optional tool calling.
-
-    Uses OpenAI Agents SDK — provider routing handled automatically.
-    reasoning=True enables model thinking (OpenRouter `reasoning.enabled`), which
-    qwen3.7-flash needs to emit structured tool calls (otherwise it writes code
-    as plain text). Only set it on the answer path, NOT the search-key path.
-    """
-    client = _build_cheap_client()
-    model_id = get_cheap_model()
+    """Run the cheap Agent for ONE specific model. Raises on failure — the
+    caller (call_cheap) owns retry and fallback policy."""
+    client = _client_for_model(model_id)
 
     # Build the SDK model
     sdk_model = OpenAIChatCompletionsModel(
@@ -461,30 +508,128 @@ async def call_cheap(
         tools=use_tools,
         model=sdk_model,
     )
-    if reasoning:
-        # OpenRouter reasoning control via SDK ModelSettings.extra_body (merged to
-        # top-level "reasoning" in the HTTP body — NOT an "extra_body" field).
-        agent_kwargs["model_settings"] = ModelSettings(extra_body={"reasoning": {"enabled": True}})
+    ms = _reasoning_settings(model_id, force_reasoning=reasoning)
+    if ms is not None:
+        agent_kwargs["model_settings"] = ms
     agent = Agent(**agent_kwargs)
 
-    try:
-        # Convert messages to input string
-        input_text = "\n".join(
-            f"{m['role']}: {m['content']}" for m in user_messages[-5:]
+    # Convert messages to input string
+    input_text = "\n".join(
+        f"{m['role']}: {m['content']}" for m in user_messages[-5:]
+    )
+
+    result = await Runner.run(agent, input=input_text, max_turns=30)
+
+    # Track usage (SDK 0.20.0: usage on raw ModelResponses, not RunResult)
+    if result:
+        global _last_usage
+        _last_usage = _extract_usage(result, model_id)
+
+    return result.final_output if result else "(no response)"
+
+
+async def call_cheap(
+    messages: list[dict],
+    temperature: float = 0.7,
+    max_tokens: int = 8192,
+    tools: list | None = None,
+    reasoning: bool = False,
+) -> str:
+    """Call cheap model with retries and a configurable fallback model.
+
+    Retries the primary cheap model up to CHEAP_FALLBACK_RETRIES attempts (the
+    OpenAI client additionally retries 429/5xx once per attempt). If every
+    attempt raises — rate limit, 5xx, timeout — switches to the fallback model
+    (set via /model -cb or CHEAP_FALLBACK_MODEL env) and returns ITS answer.
+    Only if the fallback also fails does it return the usual "(error: ...)".
+
+    reasoning=True enables model thinking (OpenRouter `reasoning.enabled`), which
+    qwen3.7-flash needs to emit structured tool calls (otherwise it writes code
+    as plain text). Only set it on the answer path, NOT the search-key path.
+    """
+    primary = get_cheap_model()
+    attempts = max(1, CHEAP_FALLBACK_RETRIES)
+    last_err: Exception | None = None
+
+    for i in range(attempts):
+        try:
+            return await _run_cheap_agent(primary, messages, temperature, max_tokens, tools, reasoning)
+        except Exception as e:
+            last_err = e
+            logger.warning("Cheap model %s attempt %d/%d failed: %s", primary, i + 1, attempts, e)
+            if i < attempts - 1:
+                await asyncio.sleep(0.5 * (i + 1))
+
+    fallback = get_cheap_fallback_model()
+    if fallback and fallback != primary:
+        logger.warning(
+            "Cheap model %s failed after %d attempts — falling back to %s",
+            primary, attempts, fallback,
         )
+        try:
+            return await _run_cheap_agent(fallback, messages, temperature, max_tokens, tools, reasoning)
+        except Exception as e:
+            last_err = e
+            logger.warning("Cheap fallback %s also failed: %s", fallback, e)
 
-        result = await Runner.run(agent, input=input_text, max_turns=30)
+    return f"(error: {last_err})"
 
-        # Track usage (SDK 0.20.0: usage on raw ModelResponses, not RunResult)
-        if result:
-            global _last_usage
-            _last_usage = _extract_usage(result, model_id)
 
-        return result.final_output if result else "(no response)"
+async def call_cheap_raw(
+    messages: list[dict],
+    temperature: float = 0.7,
+    max_tokens: int = 8192,
+    **client_kwargs,
+) -> tuple[Any, str]:
+    """Raw chat.completions call on the cheap model, with the same retry +
+    fallback policy as call_cheap.
 
-    except Exception as e:
-        logger.warning(f"Cheap model failed: {e}")
-        return f"(error: {e})"
+    For callers that need the raw response object (code path judge/writer)
+    instead of the Agent SDK. Returns (response, model_used). Raises if both
+    the primary and the fallback fail.
+    """
+    primary = get_cheap_model()
+    attempts = max(1, CHEAP_FALLBACK_RETRIES)
+    last_err: Exception | None = None
+
+    for i in range(attempts):
+        try:
+            client = _client_for_model(primary)
+            resp = await client.chat.completions.create(
+                model=primary,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **client_kwargs,
+            )
+            return resp, primary
+        except Exception as e:
+            last_err = e
+            logger.warning("Cheap raw %s attempt %d/%d failed: %s", primary, i + 1, attempts, e)
+            if i < attempts - 1:
+                await asyncio.sleep(0.5 * (i + 1))
+
+    fallback = get_cheap_fallback_model()
+    if fallback and fallback != primary:
+        logger.warning(
+            "Cheap raw %s failed after %d attempts — falling back to %s",
+            primary, attempts, fallback,
+        )
+        try:
+            client = _client_for_model(fallback)
+            resp = await client.chat.completions.create(
+                model=fallback,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **client_kwargs,
+            )
+            return resp, fallback
+        except Exception as e:
+            last_err = e
+            logger.warning("Cheap raw fallback %s also failed: %s", fallback, e)
+
+    raise last_err  # type: ignore[misc]
 
 
 async def call_expensive(
@@ -498,31 +643,25 @@ async def call_expensive(
     """
     model_id = get_expensive_model()
 
-    # OpenRouter-format IDs (org/model) route straight to OpenRouter — the
-    # DeepSeek direct API only recognizes native IDs (deepseek-v4-pro, etc.)
-    # and rejects "upstage/solar-pro4" with a wasted round-trip. (Restores the
-    # auto-detect from before the SDK migration — see skill pitfall 50.)
-    is_or = "/" in model_id
-
-    if is_or:
-        text = await _call_expensive_with_client(
-            messages, temperature, max_tokens, _build_cheap_client(), model_id
-        )
-        return text, model_id
-
-    # Native DeepSeek ID: try direct first, fall back to OpenRouter on failure
+    # Route by model id: Engy ids -> Engy, OpenRouter ("org/model") -> OpenRouter,
+    # native DeepSeek ids -> DeepSeek direct. Non-OpenRouter failures fall back
+    # to OpenRouter.
+    client = _client_for_model(model_id)
     try:
         text = await _call_expensive_with_client(
-            messages, temperature, max_tokens, _build_expensive_client(), model_id
+            messages, temperature, max_tokens, client, model_id
         )
         return text, model_id
     except Exception as e:
-        logger.warning(f"Expensive direct failed ({e}), falling back to OpenRouter")
+        logger.warning(f"Expensive {model_id} failed ({e}), falling back to OpenRouter")
 
-    # Fallback: OpenRouter
-    fallback_client = _build_cheap_client()
+    # Fallback: OpenRouter. Engy's native id (deepseek-v4-flash-0731) isn't
+    # served by OpenRouter, so swap in the OpenRouter-equivalent model.
+    fallback_id = model_id
+    if model_id in ENGY_MODELS:
+        fallback_id = ENGY_FALLBACK_MODEL
     text = await _call_expensive_with_client(
-        messages, temperature, max_tokens, fallback_client, model_id
+        messages, temperature, max_tokens, _build_cheap_client(), fallback_id
     )
     return text, f"{model_id} (fallback)"
 
@@ -548,12 +687,16 @@ async def _call_expensive_with_client(
         else:
             user_messages.append(m)
 
-    agent = Agent(
+    agent_kwargs = dict(
         name="LowCostLLM-Expensive",
         instructions=system_prompt.strip() or "You are a helpful assistant with web search and browsing tools.",
         tools=ALL_TOOLS,
         model=sdk_model,
     )
+    ms = _reasoning_settings(model_id)
+    if ms is not None:
+        agent_kwargs["model_settings"] = ms
+    agent = Agent(**agent_kwargs)
 
     input_text = "\n".join(
         f"{m['role']}: {m['content']}" for m in user_messages[-10:]
@@ -579,17 +722,20 @@ async def call_curator_verdict(cached_question: str, cached_answer: str) -> str:
     from curator import build_curator_messages
 
     model_id = get_expensive_model()
-    is_or = "/" in model_id
-    client = _build_cheap_client() if is_or else _build_expensive_client()
+    client = _client_for_model(model_id)
 
     msgs = build_curator_messages(cached_question, cached_answer)
     sdk_model = OpenAIChatCompletionsModel(model=model_id, openai_client=client)
-    agent = Agent(
+    agent_kwargs = dict(
         name="CacheCurator",
         instructions=msgs[0]["content"],
         tools=[],
         model=sdk_model,
     )
+    ms = _reasoning_settings(model_id)
+    if ms is not None:
+        agent_kwargs["model_settings"] = ms
+    agent = Agent(**agent_kwargs)
     try:
         result = await Runner.run(agent, input=msgs[1]["content"], max_turns=1)
         return result.final_output if result else ""
@@ -656,10 +802,13 @@ async def call_cheap_full(
 ) -> dict:
     """Call cheap model — returns full response dict for proxy compatibility."""
     text = await call_cheap(messages, temperature, max_tokens, tools)
+    # Report the model that ACTUALLY answered (fallback may have fired), so the
+    # calling card is honest. get_last_usage()["model"] is set by _run_cheap_agent.
+    used = get_last_usage().get("model") or get_cheap_model()
     return {
         "content": text,
         "tool_calls": None,
-        "model": get_cheap_model(),
+        "model": used,
         "usage": get_last_usage(),
         "finish_reason": "stop",
     }

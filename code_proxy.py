@@ -26,7 +26,7 @@ from openai import AsyncOpenAI
 from llm import (
     _build_cheap_client,
     _build_expensive_client,
-    get_cheap_model,
+    call_cheap_raw,
     get_expensive_model,
 )
 from proxy import _extract_query_info, _format_sse
@@ -180,12 +180,11 @@ def _message_dict(resp) -> dict:
 
 
 async def _judge(cached_q: str, cached_a: str, new_q: str) -> dict | None:
-    client = _build_cheap_client()
-    model = get_cheap_model()
     prompt = JUDGE_PROMPT.format(cached_q=cached_q, cached_a=cached_a, new_q=new_q)
-    resp = await client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
+    # call_cheap_raw applies the same retry + fallback policy as the chat path,
+    # so a rate-limited cheap model doesn't silently kill routing decisions.
+    resp, model = await call_cheap_raw(
+        [{"role": "user", "content": prompt}],
         temperature=JUDGE_TEMPERATURE,
         max_tokens=JUDGE_MAX_TOKENS,
         **_no_reasoning(),
@@ -193,7 +192,7 @@ async def _judge(cached_q: str, cached_a: str, new_q: str) -> dict | None:
     content = resp.choices[0].message.content or ""
     verdict = _parse_verdict(content)
     if verdict is None:
-        logger.info("code judge -> parse failure (raw=%r)", content[:120])
+        logger.info("code judge -> parse failure (model=%s raw=%r)", model, content[:120])
     else:
         logger.info(
             "code judge -> p_solve=%.2f boundary=%s crux=%r rule=%r",
@@ -206,24 +205,24 @@ async def _judge(cached_q: str, cached_a: str, new_q: str) -> dict | None:
 
 
 async def _write_code(cached_q, cached_a, messages: list[dict], tools=None) -> dict:
-    client = _build_cheap_client()
-    model = get_cheap_model()
     last_user_msg = ""
     for m in reversed(messages):
         if m.get("role") == "user":
             last_user_msg = m.get("content", "") or ""
             break
     prompt = WRITER_PROMPT.format(cached_q=cached_q, cached_a=cached_a, new_q=last_user_msg)
-    kw = dict(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
+    kw: dict = dict(
         temperature=WRITER_TEMPERATURE,
         max_tokens=CODE_WRITER_MAX_TOKENS,
         **_no_reasoning(),
     )
     if tools:
         kw["tools"] = tools
-    resp = await client.chat.completions.create(**kw)
+    # Same retry + fallback policy as the chat path (rate-limited cheap model
+    # → fallback model instead of a dead code answer).
+    resp, model = await call_cheap_raw(
+        [{"role": "user", "content": prompt}], **kw,
+    )
     return {
         "message": _message_dict(resp),
         "model": model,

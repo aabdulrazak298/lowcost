@@ -397,7 +397,8 @@ async def process_query(
             record_irrelevant_escalation(user_query, match["query"], answer)
         else:
             increment_hit_count(match["id"])
-            model_used = f"{get_cheap_model()} (cached)"
+            # Report the model that ACTUALLY answered — fallback may have fired.
+            model_used = f"{usage.get('model') or get_cheap_model()} (cached)"
             record_request(hit=True, model=model_used)
             return answer, model_used, _get_generated_images(), usage
 
@@ -440,7 +441,9 @@ async def process_query_stream(
     if AGENTIC_CACHE:
         is_escalate, answer = await _agentic_cache_flow(user_query, turns_to_string(turns))
         if not is_escalate:
-            model_used = f"{get_cheap_model()} (agentic-cached)"
+            # Report the model that ACTUALLY answered — fallback may have fired.
+            usage = get_last_usage()
+            model_used = f"{usage.get('model') or get_cheap_model()} (agentic-cached)"
             record_request(hit=True, model=model_used)
             if asyncio.iscoroutinefunction(callback):
                 await callback(answer)
@@ -495,7 +498,9 @@ async def process_query_stream(
             record_irrelevant_escalation(user_query, match["query"], answer)
         else:
             increment_hit_count(match["id"])
-            model_used = f"{get_cheap_model()} (cached)"
+            # Report the model that ACTUALLY answered — fallback may have fired.
+            usage = get_last_usage()
+            model_used = f"{usage.get('model') or get_cheap_model()} (cached)"
             record_request(hit=True, model=model_used)
             if asyncio.iscoroutinefunction(callback):
                 await callback(answer)

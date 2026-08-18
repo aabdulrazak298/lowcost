@@ -17,6 +17,7 @@ from llm import set_delivery_context, clear_delivery_context
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS, AVAILABLE_MODELS,
     get_cheap_model, set_cheap_model, get_expensive_model, set_expensive_model,
+    get_cheap_fallback_model, set_cheap_fallback_model,
     get_voice_enabled, set_voice_enabled, get_voice_engine, set_voice_engine,
 )
 
@@ -37,7 +38,7 @@ async def _send_rich(chat_id: int, markdown_text: str) -> bool:
             "rich_message": rich_msg.to_dict(),
             "link_preview_options": {"is_disabled": True},
         }
-        async with httpx.AsyncClient(timeout=15) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendRichMessage",
                 json=payload,
@@ -60,9 +61,18 @@ async def _send_entity_fallback(chat_id: int, text: str, context: ContextTypes.D
             text=tg_text[:TG_CHAR_LIMIT],
             entities=entities,
         )
-    except Exception:
-        # Last resort: plain text
+        return
+    except Exception as e:
+        logger.warning("Entity send failed: %s", e)
+    # Last resort: plain text — MUST never raise (an escaping exception skips
+    # stop_typing.set() downstream and leaks the typing task forever).
+    try:
         await context.bot.send_message(chat_id=chat_id, text=text[:TG_CHAR_LIMIT])
+    except Exception as e:
+        logger.error(
+            "All send paths failed for chat %s — response lost. Response was:\n%s",
+            chat_id, text[:2000],
+        )
 
 
 async def _send_response(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -125,12 +135,16 @@ async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cheap = get_cheap_model()
     expensive = get_expensive_model()
+    cheap_fallback = get_cheap_fallback_model()
     await update.message.reply_text(
         f"🤖 **LowCostLLM**\n\n"
         f"Cheap: `{cheap}`\n"
-        f"Expensive: `{expensive}`\n\n"
+        f"Expensive: `{expensive}`\n"
+        f"Cheap fallback: `{cheap_fallback or 'OFF'}`\n\n"
         f"/model -c <name> — swap cheap model\n"
         f"/model -e <name> — swap expensive\n"
+        f"/model -cb <name> — cheap fallback model (used if cheap fails, e.g. rate limit)\n"
+        f"/model -cb off — disable cheap fallback\n"
         f"/model list — show all available\n"
         f"/voice — voice replies (on/off, edge/kokoro)\n"
         f"/new — clear chat context",
@@ -143,11 +157,14 @@ async def _model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not args:
         cheap = get_cheap_model()
         expensive = get_expensive_model()
+        cheap_fallback = get_cheap_fallback_model()
         await update.message.reply_text(
-            f"Current models:\n• Cheap: `{cheap}`\n• Expensive: `{expensive}`\n\n"
+            f"Current models:\n• Cheap: `{cheap}`\n• Expensive: `{expensive}`\n"
+            f"• Cheap fallback: `{cheap_fallback or 'OFF'}`\n\n"
             f"Use /model list to see options.\n"
             f"/model -c <name> — swap cheap\n"
-            f"/model -e <name> — swap expensive",
+            f"/model -e <name> — swap expensive\n"
+            f"/model -cb <name> — cheap fallback (or off to disable)",
             parse_mode="Markdown",
         )
         return
@@ -194,12 +211,50 @@ async def _model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # Fallback: bare key → set cheap model
-    if sub in AVAILABLE_MODELS:
-        full_id, provider = AVAILABLE_MODELS[sub]
-        set_cheap_model(full_id)
+    if sub in ("-cb", "cheapfallback"):
+        # Cheap fallback model — used when the primary cheap model keeps
+        # failing (rate limit, 5xx, timeout) after its retries.
+        if len(args) < 2:
+            current = get_cheap_fallback_model()
+            await update.message.reply_text(
+                f"Current cheap fallback: `{current or 'OFF'}`\n"
+                f"Usage: /model -cb <name>  (or /model -cb off to disable)\n"
+                f"Use /model list to see options.",
+                parse_mode="Markdown",
+            )
+            return
+
+        key = args[1].lower()
+        if key in ("off", "none", "disable", "-"):
+            set_cheap_fallback_model(None)
+            await update.message.reply_text(
+                "✅ Cheap fallback → OFF (no fallback when cheap model fails)",
+                parse_mode="Markdown",
+            )
+            return
+
+        if key not in AVAILABLE_MODELS:
+            await update.message.reply_text(
+                f"❌ Unknown model: `{key}`\nUse /model list to see options.",
+                parse_mode="Markdown",
+            )
+            return
+
+        full_id, provider = AVAILABLE_MODELS[key]
+        set_cheap_fallback_model(full_id)
         await update.message.reply_text(
-            f"✅ Cheap → `{full_id}` ({provider})",
+            f"✅ Cheap fallback → `{full_id}` ({provider})",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Strict: a bare model key without a flag is ambiguous — refuse and show
+    # usage instead of silently mutating the cheap model (was a silent trap).
+    if sub in AVAILABLE_MODELS:
+        await update.message.reply_text(
+            f"❌ Missing flag: `{sub}` is a model name, not a command.\n"
+            f"Use `/model -c {sub}` for cheap or `/model -e {sub}` for expensive.\n"
+            f"Use /model list to see options.",
             parse_mode="Markdown",
         )
     else:
@@ -213,10 +268,12 @@ async def _new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     cheap = get_cheap_model()
     expensive = get_expensive_model()
+    cheap_fallback = get_cheap_fallback_model()
     await update.message.reply_text(
         f"🆕 Session cleared!\n"
         f"Cheap: `{cheap}`\n"
-        f"Expensive: `{expensive}`",
+        f"Expensive: `{expensive}`\n"
+        f"Cheap fallback: `{cheap_fallback or 'OFF'}`",
         parse_mode="Markdown",
     )
 
@@ -292,56 +349,62 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     asyncio.create_task(_keep_typing())
     await asyncio.sleep(0)  # Yield so typing task fires immediately
 
-    # Check allowed users
-    if TELEGRAM_ALLOWED_USERS:
-        allowed = [u.strip() for u in TELEGRAM_ALLOWED_USERS.split(",") if u.strip()]
-        if allowed and user_id not in allowed and str(chat_id) not in allowed:
-            stop_typing.set()
-            await update.message.reply_text("⛔ Access denied.")
+    try:
+        # Check allowed users
+        if TELEGRAM_ALLOWED_USERS:
+            allowed = [u.strip() for u in TELEGRAM_ALLOWED_USERS.split(",") if u.strip()]
+            if allowed and user_id not in allowed and str(chat_id) not in allowed:
+                await update.message.reply_text("⛔ Access denied.")
+                return
+
+        # Build chat history from user_data (list of {role, content} turns)
+        history = context.user_data.get("history", [])
+
+        # Process through the shared pipeline
+        try:
+            # Bind delivery target so image tools can self-deliver via sendPhoto
+            set_delivery_context("telegram", chat_id, TELEGRAM_BOT_TOKEN)
+            try:
+                response, model_used, _images, usage = await process_query(
+                    user_query=user_msg,
+                    chat_history=history[-10:],
+                )
+            finally:
+                clear_delivery_context()
+        except Exception as e:
+            logger.exception(f"Query processing failed: {e}")
+            try:
+                await update.message.reply_text(
+                    f"❌ Sorry, something went wrong: {type(e).__name__}\n\n"
+                    f"Details: {e}\n\nPlease try again in a moment."
+                )
+            except Exception as send_err:
+                logger.error(f"Error reply also failed: {send_err}")
             return
 
-    # Build chat history from user_data (list of {role, content} turns)
-    history = context.user_data.get("history", [])
+        # Update history
+        history.append({"role": "user", "content": user_msg})
+        history.append({"role": "assistant", "content": response})
+        if len(history) > 20:
+            history = history[-20:]
+        context.user_data["history"] = history
 
-    # Process through the shared pipeline
-    try:
-        # Bind delivery target so image tools can self-deliver via sendPhoto
-        set_delivery_context("telegram", chat_id, TELEGRAM_BOT_TOKEN)
-        try:
-            response, model_used, _images, usage = await process_query(
-                user_query=user_msg,
-                chat_history=history[-10:],
-            )
-        finally:
-            clear_delivery_context()
-    except Exception as e:
-        logger.exception(f"Query processing failed: {e}")
+        # Build calling card with short model name and REAL cost (shared helper)
+        from config import build_calling_card
+
+        footer = build_calling_card(model_used, usage)
+        full_response = response + footer
+
+        # Send — voice bubble + hidden transcript if voice mode is ON
+        if get_voice_enabled():
+            await _send_voice_response(update, chat_id, response, full_response, context)
+        else:
+            await _send_response(chat_id, full_response, context)
+    finally:
+        # ALWAYS stop the typing task — an exception escaping any send path
+        # previously skipped this and leaked the task forever (observed:
+        # "Telegram error: Timed out" → typing indicator ran indefinitely).
         stop_typing.set()
-        await update.message.reply_text(
-            f"❌ Sorry, something went wrong: {type(e).__name__}\n\n"
-            f"Details: {e}\n\nPlease try again in a moment."
-        )
-        return
-
-    # Update history
-    history.append({"role": "user", "content": user_msg})
-    history.append({"role": "assistant", "content": response})
-    if len(history) > 20:
-        history = history[-20:]
-    context.user_data["history"] = history
-
-    # Build calling card with short model name and REAL cost (shared helper)
-    from config import build_calling_card
-
-    footer = build_calling_card(model_used, usage)
-    full_response = response + footer
-
-    # Send — voice bubble + hidden transcript if voice mode is ON
-    if get_voice_enabled():
-        await _send_voice_response(update, chat_id, response, full_response, context)
-    else:
-        await _send_response(chat_id, full_response, context)
-    stop_typing.set()
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

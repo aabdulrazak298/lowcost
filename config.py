@@ -17,6 +17,15 @@ CHEAP_API_KEY = os.getenv("CHEAP_API_KEY", "")
 CHEAP_BASE_URL = os.getenv("CHEAP_BASE_URL", "https://openrouter.ai/api/v1")
 CHEAP_MODEL = os.getenv("CHEAP_MODEL", "qwen/qwen3.7-flash")
 
+# Cheap fallback model — used when the primary cheap model keeps failing
+# (rate limit, 5xx, timeout) after CHEAP_FALLBACK_RETRIES attempts. Defaults to
+# a different vendor (DeepSeek via OpenRouter) so a Qwen rate limit doesn't
+# take down the fallback too. Configurable via /model -cb; set to "" to
+# disable. Retry semantics: the OpenAI client also retries 429/5xx once per
+# attempt, so CHEAP_FALLBACK_RETRIES=2 ≈ up to 4 HTTP attempts before fallback.
+CHEAP_FALLBACK_MODEL = os.getenv("CHEAP_FALLBACK_MODEL", "deepseek/deepseek-v4-flash")
+CHEAP_FALLBACK_RETRIES = int(os.getenv("CHEAP_FALLBACK_RETRIES", "2"))
+
 # Expensive model — DeepSeek V4 Pro direct API (native tool calling)
 EXPENSIVE_API_KEY = os.getenv("EXPENSIVE_API_KEY", "")
 EXPENSIVE_BASE_URL = os.getenv("EXPENSIVE_BASE_URL", "https://api.deepseek.com/v1")
@@ -27,23 +36,57 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "deepseek/deepseek-v4-flash")
 FALLBACK_API_KEY = os.getenv("FALLBACK_API_KEY", "")
 FALLBACK_BASE_URL = os.getenv("FALLBACK_BASE_URL", "https://openrouter.ai/api/v1")
 
+# Engy — decentralized verified inference (Bittensor SN53). OpenAI-compatible.
+ENGY_API_KEY = os.getenv("ENGY_API_KEY", "")
+ENGY_BASE_URL = os.getenv("ENGY_BASE_URL", "https://api.engy.ai/v1")
+ENGY_MODEL = os.getenv("ENGY_MODEL", "deepseek-v4-flash-0731")
+
+# Model IDs served by Engy (routed to the Engy client, not DeepSeek/OpenRouter).
+# Engy's native IDs carry no org prefix, so they never collide with the
+# OpenRouter-style "org/model" IDs in AVAILABLE_MODELS.
+ENGY_MODELS = {
+    "deepseek-v4-flash-0731",
+    "qwen3.6-35b-a3b",
+    "qwen3.8-27b",
+    "glm-5.2",
+    "kimi-k3",
+}
+
+# OpenRouter equivalent used when an Engy model fails (OpenRouter has no 0731 build)
+ENGY_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
+
 # ── Runtime model overrides (set by /model command, persisted to DB) ──
 _cheap_override: str | None = None
 _expensive_override: str | None = None
+# Cheap fallback: None = not configured (use env default), "" = explicitly
+# disabled via /model -cb off, otherwise the model id.
+_cheap_fallback_override: str | None = None
 
 
 def _load_overrides_from_db() -> None:
     """Restore model overrides from the database after restart."""
-    global _cheap_override, _expensive_override
+    global _cheap_override, _expensive_override, _cheap_fallback_override
     try:
-        from db import get_conn
+        from db import ensure_overrides_schema, get_conn
+        ensure_overrides_schema()
         conn = get_conn()
-        row = conn.execute(
-            "SELECT cheap_override, expensive_override FROM model_overrides WHERE id = 1"
-        ).fetchone()
-        if row:
-            _cheap_override = row["cheap_override"]
-            _expensive_override = row["expensive_override"]
+        try:
+            row = conn.execute(
+                "SELECT cheap_override, expensive_override, cheap_fallback_override "
+                "FROM model_overrides WHERE id = 1"
+            ).fetchone()
+            if row:
+                _cheap_override = row["cheap_override"]
+                _expensive_override = row["expensive_override"]
+                _cheap_fallback_override = row["cheap_fallback_override"]
+        except Exception:
+            # Older DB without the fallback column — load the two known columns.
+            row = conn.execute(
+                "SELECT cheap_override, expensive_override FROM model_overrides WHERE id = 1"
+            ).fetchone()
+            if row:
+                _cheap_override = row["cheap_override"]
+                _expensive_override = row["expensive_override"]
     except Exception:
         pass
 
@@ -54,6 +97,11 @@ def get_cheap_model() -> str:
 
 def get_expensive_model() -> str:
     return _expensive_override or EXPENSIVE_MODEL
+
+
+def get_cheap_fallback_model() -> str | None:
+    """Return the cheap fallback model id, or None/'' when disabled."""
+    return _cheap_fallback_override if _cheap_fallback_override is not None else CHEAP_FALLBACK_MODEL
 
 
 def set_cheap_model(model_id: str | None) -> None:
@@ -68,15 +116,24 @@ def set_expensive_model(model_id: str | None) -> None:
     _save_overrides_to_db()
 
 
+def set_cheap_fallback_model(model_id: str | None) -> None:
+    """Set the cheap fallback model. None or '' disables fallback entirely."""
+    global _cheap_fallback_override
+    _cheap_fallback_override = (model_id or "").strip() or ""
+    _save_overrides_to_db()
+
+
 def _save_overrides_to_db() -> None:
     """Persist overrides so they survive restarts."""
     try:
-        from db import get_conn
+        from db import ensure_overrides_schema, get_conn
+        ensure_overrides_schema()
         conn = get_conn()
         conn.execute(
-            "INSERT OR REPLACE INTO model_overrides (id, cheap_override, expensive_override) "
-            "VALUES (1, ?, ?)",
-            (_cheap_override, _expensive_override),
+            "INSERT OR REPLACE INTO model_overrides "
+            "(id, cheap_override, expensive_override, cheap_fallback_override) "
+            "VALUES (1, ?, ?, ?)",
+            (_cheap_override, _expensive_override, _cheap_fallback_override),
         )
         conn.commit()
     except Exception:
@@ -102,6 +159,8 @@ AVAILABLE_MODELS = {
     "sonnet":     ("anthropic/claude-sonnet-4", "OpenRouter"),
     "nemotron":   ("nvidia/nemotron-3-ultra-550b-a55b", "OpenRouter"),
     "solar":      ("upstage/solar-pro4", "OpenRouter"),
+    "flash-engy": ("deepseek-v4-flash-0731", "Engy"),
+    "qwen3.8-27b-engy": ("qwen3.8-27b", "Engy"),
 }
 
 # Output pricing per 1M tokens (keyed by model key)
@@ -110,16 +169,35 @@ MODEL_PRICING: dict[str, float] = {
     "qwen-plus": 1.28, "flash": 0.28, "flash-ds": 0.28, "pro": 0.87,
     "m3": 2.40, "gemini": 2.50, "gemini-lite": 1.50,
     "llama": 0.85, "luna": 6.00, "ling": 0.021, "sonnet": 15.00, "nemotron": 2.20, "solar": 0.12,
+    "flash-engy": 0.09,
+    "qwen3.8-27b-engy": 0.32,
 }
+
+
+def _resolve_key(model_id: str) -> str | None:
+    """Map a model id back to its registry key via LONGEST full_id match.
+
+    Longest-match (not first-match) so a shorter id that is a substring of a
+    longer one (e.g. "deepseek-v4-flash" is a substring of
+    "deepseek-v4-flash-0731") can't steal the match from the more specific
+    model.
+    """
+    best_key, best_len = None, -1
+    mid = (model_id or "").lower()
+    for key, (full_id, _) in AVAILABLE_MODELS.items():
+        fid = (full_id or "").lower()
+        if fid and fid in mid and len(fid) > best_len:
+            best_key, best_len = key, len(fid)
+    return best_key
 
 
 def estimate_cost(model_id: str, output_chars: int) -> float:
     """Estimate cost based on model output pricing and char count (3.5 chars ≈ 1 token)."""
-    for key, (full_id, _) in AVAILABLE_MODELS.items():
-        if full_id.lower() in model_id.lower():
-            price = MODEL_PRICING.get(key, 0.28)
-            tokens = output_chars / 3.5
-            return (tokens / 1_000_000) * price
+    key = _resolve_key(model_id)
+    if key:
+        price = MODEL_PRICING.get(key, 0.28)
+        tokens = output_chars / 3.5
+        return (tokens / 1_000_000) * price
     return 0.0
 
 
@@ -132,20 +210,16 @@ def build_calling_card(model_used: str, usage: dict | None = None) -> str:
     usage = usage or {}
 
     # Shorten model id to its registry key ("qwen/qwen3.7-flash" -> "qwen").
-    short_name = model_used
-    for key, (full_id, _) in AVAILABLE_MODELS.items():
-        if full_id in model_used:
-            short_name = f"{key} (cached)" if "(cached)" in model_used else key
-            break
+    key = _resolve_key(model_used)
+    if key:
+        short_name = f"{key} (cached)" if "(cached)" in model_used else key
+    else:
+        short_name = model_used
 
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
     if prompt_tokens or completion_tokens:
-        price_per_m = 0.28  # default
-        for key, (full_id, _) in AVAILABLE_MODELS.items():
-            if full_id in model_used:
-                price_per_m = MODEL_PRICING.get(key, 0.28)
-                break
+        price_per_m = MODEL_PRICING.get(key, 0.28) if key else 0.28
         total_tokens = prompt_tokens + completion_tokens
         cost = (total_tokens / 1_000_000) * price_per_m
         cost_str = f" · ${cost:.6f} · {total_tokens} tok"

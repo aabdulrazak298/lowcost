@@ -438,10 +438,36 @@ def _init_overrides_table(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS model_overrides (
             id                  INTEGER PRIMARY KEY CHECK (id = 1),
             cheap_override      TEXT,
-            expensive_override  TEXT
+            expensive_override  TEXT,
+            cheap_fallback_override TEXT
         )
     """)
     conn.execute("INSERT OR IGNORE INTO model_overrides (id) VALUES (1)")
+    _migrate_overrides_table(conn)
+
+
+def _migrate_overrides_table(conn: sqlite3.Connection) -> None:
+    """Add cheap_fallback_override column if upgrading from an older schema."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(model_overrides)").fetchall()}
+    if "cheap_fallback_override" not in cols:
+        try:
+            conn.execute("ALTER TABLE model_overrides ADD COLUMN cheap_fallback_override TEXT")
+            conn.commit()
+        except Exception:
+            pass
+
+
+def ensure_overrides_schema() -> None:
+    """Self-healing: make sure model_overrides has the fallback column.
+
+    Called from config's load/save paths so overrides survive even when
+    init_db hasn't run yet (e.g. standalone scripts that load config).
+    """
+    try:
+        conn = get_conn()
+        _migrate_overrides_table(conn)
+    except Exception:
+        pass
 
 
 def _init_app_settings_table(conn: sqlite3.Connection) -> None:
