@@ -317,6 +317,7 @@ async def stream_chat_completion(body: dict):
 
     full_text = ""
     model_used = "deepseek-v4-pro"
+    usage = None
     logger.info("chat routing: source=%s model=%s", decision_source, model_used)
 
     try:
@@ -326,6 +327,8 @@ async def stream_chat_completion(body: dict):
             delta = chunk.get("delta", {}) or {}
             full_text += delta.get("content") or ""
             model_used = chunk.get("model") or model_used
+            if chunk.get("usage"):
+                usage = chunk["usage"]
             yield _format_sse(chat_id, created, model_used, chunk)
 
         yield "data: [DONE]\n\n"

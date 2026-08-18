@@ -760,14 +760,109 @@ async def call_expensive_stream(
 
 
 # ── OpenCode-compatible wrappers ──────────────────────────────────
+#
+# Tool-calling contract (Option B): when the CLIENT supplies tools, the proxy
+# must NOT run them through the Agent SDK loop (it would try to execute the
+# client's raw schema dicts). Instead it does a raw chat.completions call with
+# those tools and returns the model's tool_calls to the client, which executes
+# them and loops back. Without client tools, the agentic path (proxy's own
+# ALL_TOOLS) is unchanged.
+
+
+def _raw_response_dict(resp, model_used: str) -> dict:
+    """Convert a raw chat.completions response into the proxy dict format."""
+    choice = resp.choices[0]
+    msg = choice.message
+    tool_calls = None
+    if getattr(msg, "tool_calls", None):
+        tool_calls = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in msg.tool_calls
+        ]
+    usage = {
+        "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0) or 0,
+        "completion_tokens": getattr(resp.usage, "completion_tokens", 0) or 0,
+        "total_tokens": getattr(resp.usage, "total_tokens", 0) or 0,
+    }
+    return {
+        "content": msg.content or "",
+        "tool_calls": tool_calls,
+        "model": model_used,
+        "usage": usage,
+        "finish_reason": choice.finish_reason or "stop",
+    }
+
+
+def _tool_reasoning_kwargs() -> dict:
+    """Reasoning settings for raw tool-calling requests.
+
+    OpenRouter cheap models (qwen3.7-flash) need reasoning ENABLED to emit
+    structured tool_calls instead of code-as-text. Engy / native DeepSeek ids
+    default to thinking on — no override needed.
+    """
+    if "/" in get_cheap_model():
+        return {"extra_body": {"reasoning": {"enabled": True}}}
+    return {}
+
+
+async def _call_expensive_raw(
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    tools: list,
+) -> tuple[Any, str]:
+    """Raw chat.completions call on the expensive model with client tools.
+
+    Routes like call_expensive (Engy / OpenRouter / DeepSeek direct) and falls
+    back to OpenRouter on failure. Returns (response, model_used).
+    """
+    model_id = get_expensive_model()
+    client = _client_for_model(model_id)
+    try:
+        resp = await client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
+        return resp, model_id
+    except Exception as e:
+        logger.warning(f"Expensive raw {model_id} failed ({e}), falling back to OpenRouter")
+
+    fallback_id = ENGY_FALLBACK_MODEL if model_id in ENGY_MODELS else model_id
+    client = _build_cheap_client()
+    resp = await client.chat.completions.create(
+        model=fallback_id,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+    )
+    return resp, f"{model_id} (fallback)"
 
 
 async def call_expensive_full(
     messages: list[dict],
     temperature: float = 0.7,
     max_tokens: int = 8192,
+    tools: list | None = None,
 ) -> dict:
-    """Call expensive model — returns full response dict for proxy compatibility."""
+    """Call expensive model — returns full response dict for proxy compatibility.
+
+    With client tools: raw chat.completions, tool_calls returned to the client.
+    Without tools: agentic path (proxy's own ALL_TOOLS run inside the agent).
+    """
+    if tools:
+        resp, model = await _call_expensive_raw(messages, temperature, max_tokens, tools)
+        return _raw_response_dict(resp, model)
     text, model = await call_expensive(messages, temperature, max_tokens)
     return {
         "content": text,
@@ -782,15 +877,112 @@ async def stream_expensive_full(
     messages: list[dict],
     temperature: float = 0.7,
     max_tokens: int = 8192,
-) -> dict:
-    """Streaming wrapper — returns same dict format for proxy compatibility."""
+    tools: list | None = None,
+):
+    """Streaming wrapper — async generator yielding SSE-style chunk dicts.
+
+    With client tools: true streaming via raw chat.completions (tool_calls
+    deltas included). Without tools: agentic path, buffered then re-chunked so
+    the proxy sees the same chunk shape either way.
+    """
+    if tools:
+        model_id = get_expensive_model()
+        client = _client_for_model(model_id)
+        stream = None
+        try:
+            stream = await client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+        except Exception as e:
+            logger.warning(
+                f"Expensive stream {model_id} with stream_options failed ({e}), "
+                "retrying without usage tracking"
+            )
+            try:
+                stream = await client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    stream=True,
+                )
+            except Exception as e2:
+                logger.warning(
+                    f"Expensive stream {model_id} failed ({e2}), falling back to OpenRouter"
+                )
+                model_id = ENGY_FALLBACK_MODEL if model_id in ENGY_MODELS else model_id
+                client = _build_cheap_client()
+                stream = await client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    stream=True,
+                )
+
+        async for chunk in stream:
+            if not chunk.choices:
+                # usage-only chunk (stream_options include_usage final chunk)
+                if getattr(chunk, "usage", None):
+                    yield {
+                        "delta": {},
+                        "model": model_id,
+                        "finish_reason": None,
+                        "usage": {
+                            "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                            "completion_tokens": chunk.usage.completion_tokens or 0,
+                            "total_tokens": chunk.usage.total_tokens or 0,
+                        },
+                    }
+                continue
+            choice = chunk.choices[0]
+            delta = {}
+            if choice.delta.content:
+                delta["content"] = choice.delta.content
+            if getattr(choice.delta, "tool_calls", None):
+                delta["tool_calls"] = [
+                    {
+                        "index": tc.index,
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in choice.delta.tool_calls
+                ]
+            yield {
+                "delta": delta,
+                "model": model_id,
+                "finish_reason": choice.finish_reason,
+            }
+        return
+
+    # No client tools — agentic path (proxy's own tools run inside the agent),
+    # buffered and re-chunked to the same SSE shape.
     text, model = await call_expensive(messages, temperature, max_tokens)
-    return {
-        "content": text,
-        "tool_calls": None,
+    usage = get_last_usage()
+    chunk_size = 16
+    for i in range(0, len(text), chunk_size):
+        yield {
+            "delta": {"content": text[i : i + chunk_size]},
+            "model": model,
+            "finish_reason": None,
+        }
+    yield {
+        "delta": {},
         "model": model,
-        "usage": get_last_usage(),
         "finish_reason": "stop",
+        "usage": usage,
     }
 
 
@@ -800,8 +992,22 @@ async def call_cheap_full(
     max_tokens: int = 8192,
     tools: list | None = None,
 ) -> dict:
-    """Call cheap model — returns full response dict for proxy compatibility."""
-    text = await call_cheap(messages, temperature, max_tokens, tools)
+    """Call cheap model — returns full response dict for proxy compatibility.
+
+    With client tools: raw chat.completions via call_cheap_raw (same retry +
+    fallback policy), tool_calls returned to the client. Without tools:
+    agentic path (proxy's own ALL_TOOLS run inside the agent).
+    """
+    if tools:
+        resp, model = await call_cheap_raw(
+            messages,
+            temperature,
+            max_tokens,
+            tools=tools,
+            **_tool_reasoning_kwargs(),
+        )
+        return _raw_response_dict(resp, model)
+    text = await call_cheap(messages, temperature, max_tokens)
     # Report the model that ACTUALLY answered (fallback may have fired), so the
     # calling card is honest. get_last_usage()["model"] is set by _run_cheap_agent.
     used = get_last_usage().get("model") or get_cheap_model()
