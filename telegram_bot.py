@@ -29,45 +29,98 @@ TG_CHAR_LIMIT = 4096
 # ── Rich formatting helpers (ThinkLLM-style) ───────────────────
 
 
+def _chunk_text(text: str, limit: int = TG_CHAR_LIMIT) -> list[str]:
+    """Split long text at paragraph boundaries (ported from ThinkLLM).
+
+    Never truncates mid-content: prefers ``\\n\\n`` then ``\\n``, falls back to a
+    hard cut only when a single line exceeds the limit.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 4:
+            split_at = limit
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip()
+    return chunks
+
+
 async def _send_rich(chat_id: int, markdown_text: str) -> bool:
     """Send via sendRichMessage with native tables, headings, etc. Falls back gracefully."""
-    try:
-        rich_msg = richify(markdown_text)
-        payload = {
-            "chat_id": chat_id,
-            "rich_message": rich_msg.to_dict(),
-            "link_preview_options": {"is_disabled": True},
-        }
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendRichMessage",
-                json=payload,
-            )
-            if r.status_code != 200:
-                logger.warning("sendRichMessage failed: %s %s", r.status_code, r.text[:200])
-                return False
-            return True
-    except Exception as e:
-        logger.warning("sendRichMessage exception: %s", e)
-        return False
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            rich_msg = richify(markdown_text)
+            payload = {
+                "chat_id": chat_id,
+                "rich_message": rich_msg.to_dict(),
+                "link_preview_options": {"is_disabled": True},
+            }
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendRichMessage",
+                    json=payload,
+                )
+                if r.status_code != 200:
+                    logger.warning("sendRichMessage failed: %s %s", r.status_code, r.text[:200])
+                    return False
+                return True
+        except Exception as e:
+            last_exc = e
+            logger.warning("sendRichMessage exception (attempt %s): %r", attempt, e)
+            if attempt == 1:
+                await asyncio.sleep(1.0)
+    logger.warning("sendRichMessage gave up after 2 attempts: %r", last_exc)
+    return False
 
 
 async def _send_entity_fallback(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fallback: convert markdown → entities and send via sendMessage."""
+    """Fallback: convert markdown → entities and send via sendMessage.
+
+    NOTE: telegramify's ``convert()`` returns its OWN ``MessageEntity`` class
+    (telegramify_markdown.entity.MessageEntity), which python-telegram-bot cannot
+    serialize — passing them raw raises ``TypeError: not JSON serializable``.
+    Map to PTB's ``telegram.MessageEntity`` first.
+    """
     try:
         tg_text, entities = convert(text)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=tg_text[:TG_CHAR_LIMIT],
-            entities=entities,
-        )
+        ptb_entities = [
+            MessageEntity(
+                type=e.type,
+                offset=e.offset,
+                length=e.length,
+                url=getattr(e, "url", None),
+                language=getattr(e, "language", None),
+                custom_emoji_id=getattr(e, "custom_emoji_id", None),
+            )
+            for e in entities
+        ]
+        chunks = _chunk_text(tg_text)
+        if len(chunks) == 1:
+            # Single chunk ≤ limit — entity offsets stay valid, keep formatting.
+            await context.bot.send_message(
+                chat_id=chat_id, text=chunks[0], entities=ptb_entities,
+            )
+        else:
+            # Multi-chunk: entity offsets would break across splits — send plain.
+            for chunk in chunks:
+                await context.bot.send_message(chat_id=chat_id, text=chunk)
         return
     except Exception as e:
-        logger.warning("Entity send failed: %s", e)
+        logger.warning("Entity send failed: %r", e)
     # Last resort: plain text — MUST never raise (an escaping exception skips
     # stop_typing.set() downstream and leaks the typing task forever).
     try:
-        await context.bot.send_message(chat_id=chat_id, text=text[:TG_CHAR_LIMIT])
+        for chunk in _chunk_text(text):
+            await context.bot.send_message(chat_id=chat_id, text=chunk)
     except Exception as e:
         logger.error(
             "All send paths failed for chat %s — response lost. Response was:\n%s",
