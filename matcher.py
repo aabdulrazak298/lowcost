@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
 
-from db import search_candidates
+from db import search_candidates, age_days
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,49 @@ def _minmax_normalize(scores: np.ndarray) -> np.ndarray:
     return ((scores - lo) / (hi - lo)).astype(np.float32)
 
 
+def _parse_ts(created_at: str | None):
+    """Parse an SQLite UTC timestamp; unparseable → now (age 0, neutral)."""
+    if not created_at:
+        return datetime.now(timezone.utc)
+    try:
+        return datetime.strptime(created_at[:19], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, TypeError):
+        return datetime.now(timezone.utc)
+
+
+def _score_and_pick(
+    sem_scores: np.ndarray,
+    fts5_raw: np.ndarray,
+    created_ats: list[str | None],
+    threshold: float,
+) -> tuple[int, np.ndarray]:
+    """Hybrid ranking + pick: 0.70×sem + 0.25×bm25 + 0.05×recency.
+
+    sem_scores: RAW cosine (absolute, this is the gate). fts5_raw: negated
+    BM25 ranks (higher = better). created_ats: candidate created_at strings
+    (UTC) — the recency term (newest → 1.0, min-max over the batch, same
+    treatment as BM25). The gate is applied LAST: sub-threshold candidates can
+    never win, no matter how new or lexically strong they are. The recency
+    weight is deliberately small — it breaks near-ties only.
+
+    Returns (best_idx, hybrid_scores).
+    """
+    fts5_norm = _minmax_normalize(fts5_raw)
+    ages = np.array(
+        [(datetime.now(timezone.utc) - _parse_ts(c)).total_seconds() for c in created_ats],
+        dtype="float64",
+    )
+    if ages.size and ages.max() > ages.min():
+        date_norm = 1.0 - (ages - ages.min()) / (ages.max() - ages.min())
+    else:
+        date_norm = np.ones_like(ages)  # tie / single candidate → neutral
+    hybrid = 0.70 * sem_scores + 0.25 * fts5_norm + 0.05 * date_norm
+    hybrid[sem_scores < threshold] = -np.inf
+    return int(np.argmax(hybrid)), hybrid
+
+
 # ── Main lookup ──────────────────────────────────────────────
 
 
@@ -141,23 +185,23 @@ async def smart_cache_lookup(match_query: str, purpose: str = "chat") -> dict | 
             )
             return None
 
-        # Hybrid ranking (semantic + lexical tiebreak). FTS5 bm25 rank is
-        # negative (more negative = better match) — negate so higher = better,
-        # then min-max to [0,1]. (NOTE: the old code used -abs(rank), which is
-        # a no-op on negatives and left the FTS5 term useless.)
+        # Hybrid ranking (0.70 sem + 0.25 bm25 + 0.05 recency — see
+        # _score_and_pick). FTS5 bm25 rank is negative (more negative = better
+        # match): negate so higher = better, then min-max to [0,1]. (NOTE: the
+        # old code used -abs(rank), a no-op on negatives that left the FTS5
+        # term useless. The recency term is batch-relative too and only breaks
+        # near-ties — the gate below stays absolute.)
         fts5_raw = np.array([
             -float(c.get("rank", 0) or 0) for c in candidates
         ], dtype=np.float32)
-        fts5_norm = _minmax_normalize(fts5_raw)
-        hybrid = 0.7 * sem_scores + 0.3 * fts5_norm
-        # A sub-threshold candidate must never win the ranking.
-        hybrid[sem_scores < SEM_THRESHOLD] = -np.inf
+        created = [c.get("created_at") for c in candidates]
 
-        best_idx = int(np.argmax(hybrid))
+        best_idx, hybrid = _score_and_pick(sem_scores, fts5_raw, created, SEM_THRESHOLD)
         logger.info(
             "cache verdict=HIT source=semantic cosine=%.3f hybrid=%.3f candidates=%d "
-            "query=%r matched=%r",
+            "age_days=%s query=%r matched=%r",
             float(sem_scores[best_idx]), float(hybrid[best_idx]), len(candidates),
+            age_days(created[best_idx]),
             match_query[:80], candidates[best_idx].get("query", "")[:80],
         )
         return candidates[best_idx]

@@ -14,7 +14,7 @@ from llm import (
     get_last_usage,
 )
 from stats import record_request
-from processor import _is_rejection, should_cache
+from processor import _is_rejection, cache_store
 
 logger = logging.getLogger("lowcostllm.chat")
 
@@ -178,8 +178,7 @@ async def handle_chat_completion(body: dict) -> dict:
         usage = result.get("usage")
         finish_reason = result.get("finish_reason", "stop")
 
-        if should_cache(user_query, response_content):
-            upsert_qa(match_query, response_content, model_used)
+        cache_store(match_query, response_content, model_used, decision_query=user_query)
         _record(hit=False, model=model_used, usage=usage)
 
     response = {
@@ -335,8 +334,7 @@ async def stream_chat_completion(body: dict):
         yield "data: [DONE]\n\n"
 
         if full_text:
-            if should_cache(user_query, full_text):
-                upsert_qa(match_query, full_text, model_used)
+            cache_store(match_query, full_text, model_used, decision_query=user_query)
         _record(hit=False, model=model_used, usage=usage)
 
     except Exception as e:

@@ -9,7 +9,7 @@ import logging
 import re as _re
 import urllib.request
 from config import get_cheap_model, AGENTIC_CACHE
-from db import cache_lookup, upsert_qa, increment_hit_count
+from db import cache_lookup, upsert_qa, increment_hit_count, age_days
 from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images, get_last_usage
 from stats import record_request, record_irrelevant_escalation
 from curator import run_curator
@@ -336,12 +336,57 @@ def should_cache(user_query: str, answer: str) -> bool:
     if any(rx.search(ql) for rx in _UNCACHEABLE_RES):
         return False
     # Trivial exchanges — but a URL query is never trivial: "summaries <url>"
-    # is 2 split() words yet a legitimate summarise request.
-    if "http" not in ql and len(q.split()) <= 3 and len(a) < 200:
+    # is 2 split() words yet a legitimate summarise request. Threshold ≤2:
+    # "say OK" is caught; "latest news reports" (3 words, real answer) is not.
+    if "http" not in ql and len(q.split()) <= 2 and len(a) < 200:
         return False
     if len(a) < 40 and len(q.split()) <= 10:
         return False
     return True
+
+
+# ── Freshness instrumentation (step 1 of recency plan — measurement only) ──
+
+_EPHEMERAL_RE = _re.compile(
+    r"\b(latest|breaking|news|today|weather|forecast|price|stock|election|current|recent|update)\b"
+    r"|\bthis (month|week|year|quarter)\b"
+    r"|\b(as of|right now)\b",
+    _re.I,
+)
+
+
+def is_ephemeral_query(user_query: str) -> bool:
+    """True if the query is time-sensitive and its answer goes stale fast.
+
+    Measured offenders: "how many disasters ... this month alone?", "latest
+    worldwide news reports", "is earthquake this year still common". NOTE: this
+    is a heuristic — implicit time-sensitivity ("tell me more about hurricane
+    lala") is missed; an LLM-assisted classifier is the follow-up (Gemini
+    review, 2026-08-19). Used for WRITE-TIME classification + counting only.
+    """
+    return bool(_EPHEMERAL_RE.search(user_query or ""))
+
+
+def cache_store(
+    store_query: str,
+    answer: str,
+    model_used: str,
+    decision_query: str | None = None,
+    purpose: str = "chat",
+) -> None:
+    """Policy-guarded cache write with freshness classification logging.
+
+    Decides on decision_query (defaults to store_query — proxy passes the last
+    user message here while storing the broader match_query), writes under
+    store_query via upsert_qa (dedupe), and logs the freshness kind so we can
+    measure the ephemeral share before enabling expiry (step 3).
+    """
+    dq = decision_query if decision_query is not None else store_query
+    if not should_cache(dq, answer):
+        return
+    kind = "ephemeral" if is_ephemeral_query(dq) else "evergreen"
+    logger.info("cache write kind=%s query=%r", kind, store_query[:80])
+    upsert_qa(store_query, answer, model_used, purpose)
 
 
 def _is_escalate(answer: str) -> bool:
@@ -429,7 +474,8 @@ async def process_query(
             match = _lookup_exact_video(user_query)
             if match is not None:
                 logger.info(
-                    "cache verdict=HIT source=g0 query=%r matched=%r",
+                    "cache verdict=HIT source=g0 age_days=%s query=%r matched=%r",
+                    age_days(match.get("created_at")),
                     user_query[:80], match["query"][:80],
                 )
             if match is None:
@@ -514,8 +560,7 @@ async def process_query(
     messages.append({"role": "user", "content": user_query})
     answer, model_used = await call_expensive(messages)
     usage = get_last_usage()
-    if should_cache(user_query, answer):
-        upsert_qa(user_query, answer, model_used)
+    cache_store(user_query, answer, model_used)
     record_request(hit=False, model=model_used)
 
     # Curator: if we rejected a cached candidate, let the expensive model
@@ -567,7 +612,8 @@ async def process_query_stream(
             match = _lookup_exact_video(user_query)
             if match is not None:
                 logger.info(
-                    "cache verdict=HIT source=g0 query=%r matched=%r",
+                    "cache verdict=HIT source=g0 age_days=%s query=%r matched=%r",
+                    age_days(match.get("created_at")),
                     user_query[:80], match["query"][:80],
                 )
             if match is None:
@@ -656,8 +702,7 @@ async def process_query_stream(
     logger.info(f"Starting streaming for query: {user_query[:80]}")
     answer, model_used = await call_expensive_stream(messages, callback)
     logger.info(f"Streaming complete: {len(answer)} chars, model={model_used}")
-    if should_cache(user_query, answer):
-        upsert_qa(user_query, answer, model_used)
+    cache_store(user_query, answer, model_used)
     record_request(hit=False, model=model_used)
 
     # Curator: if we rejected a cached candidate, let the expensive model

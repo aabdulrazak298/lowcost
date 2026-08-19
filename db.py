@@ -176,7 +176,8 @@ def insert_qa(query: str, answer: str, model_used: str, purpose: str = "chat") -
 
     # Hot cache insert is best-effort — skip if lock contention
     try:
-        _hot_cache[str(rid)] = {"id": rid, "query": query, "answer": answer, "model_used": model_used, "hit_count": 0, "purpose": purpose}
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        _hot_cache[str(rid)] = {"id": rid, "query": query, "answer": answer, "model_used": model_used, "hit_count": 0, "purpose": purpose, "created_at": now}
         if len(_hot_cache) >= HOT_CACHE_MAX:
             _hot_cache.popitem(last=False)
     except Exception:
@@ -265,6 +266,17 @@ _FTS_STOP_WORDS = frozenset({
 })
 
 
+def age_days(created_at: str | None) -> float | None:
+    """Age of a cache entry in days (UTC created_at). None when unparseable."""
+    if not created_at:
+        return None
+    try:
+        ts = datetime.strptime(created_at[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds() / 86400.0)
+    except (ValueError, TypeError):
+        return None
+
+
 def search_candidates(query: str, limit: int = 100, purpose: str = "chat") -> list[dict]:
     """FTS5 pre-filter: find top N candidates by text relevance.
 
@@ -290,7 +302,7 @@ def search_candidates(query: str, limit: int = 100, purpose: str = "chat") -> li
     fts_query = " OR ".join(terms[:20])  # max 20 terms
 
     rows = conn.execute(
-        "SELECT qa.id, qa.query, qa.answer, qa.model_used, qa.hit_count, "
+        "SELECT qa.id, qa.query, qa.answer, qa.model_used, qa.hit_count, qa.created_at, "
         "       bm25(qa_cache_fts) AS rank "
         "FROM qa_cache_fts fts "
         "JOIN qa_cache qa ON fts.rowid = qa.id "
@@ -416,7 +428,10 @@ async def cache_lookup(match_query: str, purpose: str = "chat") -> dict | None:
 
     hot = await hot_cache_lookup(match_query, purpose)
     if hot:
-        logger.info("cache verdict=HIT source=hot query=%r", match_query[:80])
+        logger.info(
+            "cache verdict=HIT source=hot age_days=%s query=%r",
+            age_days(hot.get("created_at")), match_query[:80],
+        )
         return hot
 
     match = await smart_cache_lookup(match_query, purpose)
