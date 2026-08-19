@@ -34,6 +34,9 @@ def test_store_key_is_current_query_only():
     async def fake_cache_lookup(q, purpose="chat"):
         return None  # force a miss → expensive path
 
+    async def fake_generate_search_query(q, turns):
+        return CURRENT_QUERY  # anchored rewrite = the current query
+
     async def fake_expensive(messages):
         return "fresh answer " * 40, "deepseek-v4-pro"
 
@@ -53,6 +56,7 @@ def test_store_key_is_current_query_only():
         )
 
     with mock.patch.object(processor, "cache_lookup", fake_cache_lookup), \
+         mock.patch.object(processor, "generate_search_query", fake_generate_search_query), \
          mock.patch.object(processor, "call_expensive", fake_expensive), \
          mock.patch.object(processor, "upsert_qa", fake_upsert_qa), \
          mock.patch.object(processor, "record_request", fake_record), \
@@ -75,6 +79,9 @@ def test_store_key_is_current_query_only_stream():
     async def fake_cache_lookup(q, purpose="chat"):
         return None
 
+    async def fake_generate_search_query(q, turns):
+        return CURRENT_QUERY
+
     async def fake_expensive_stream(messages, callback):
         return "fresh answer " * 40, "deepseek-v4-pro"
 
@@ -93,6 +100,7 @@ def test_store_key_is_current_query_only_stream():
         )
 
     with mock.patch.object(processor, "cache_lookup", fake_cache_lookup), \
+         mock.patch.object(processor, "generate_search_query", fake_generate_search_query), \
          mock.patch.object(processor, "call_expensive_stream", fake_expensive_stream), \
          mock.patch.object(processor, "upsert_qa", fake_upsert_qa), \
          mock.patch.object(processor, "record_request", fake_record), \
