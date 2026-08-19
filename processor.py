@@ -248,6 +248,11 @@ _REJECTION_PHRASES = (
     "off-topic", "off topic", "wrong topic", "mismatch", "nothing to do with",
     "no relation", "different subject", "another topic", "not the same topic",
     "fresh answer", "from scratch",
+    # Confident denial — cheap model calls the cached facts fake/nonexistent
+    # from memory instead of searching (post-cutoff facts get denied this way).
+    # Escalate so the expensive model verifies with tools. "fabricat" matches
+    # fabricated/fabrication; "no such" catches "no such series/show".
+    "fabricat", "no such", "completely fictional", "never existed",
 )
 
 
@@ -367,6 +372,10 @@ async def process_query(
                     "Use web_search directly to get fresh, current information whenever "
                     "the example is stale, time-sensitive, or incomplete — search and "
                     "answer yourself; never ask the user for permission to search.\n"
+                    "NEVER declare content fabricated, fake, or nonexistent from memory: "
+                    "your training data predates today. If you don't recognize something, "
+                    "search the web FIRST — absence from your knowledge is NOT proof it "
+                    "doesn't exist.\n"
                     "Use run_code to execute Python for ANY arithmetic, calculation, "
                     "enumeration, or multi-step computation — never compute in your head.\n"
                     "If the user's message contains an [Example] block about a DIFFERENT "
@@ -383,7 +392,7 @@ async def process_query(
             f"{match['answer']}\n\n"
             f"{user_query}"
         )})
-        answer = await call_cheap(messages, tools=None, reasoning=True)
+        answer = await call_cheap(messages, temperature=0.3, tools=None, reasoning=True)
         usage = get_last_usage()
 
         # Self-check: did the cheap model reject the cached answer?
@@ -470,6 +479,10 @@ async def process_query_stream(
                     "Use web_search directly to get fresh, current information whenever "
                     "the example is stale, time-sensitive, or incomplete — search and "
                     "answer yourself; never ask the user for permission to search.\n"
+                    "NEVER declare content fabricated, fake, or nonexistent from memory: "
+                    "your training data predates today. If you don't recognize something, "
+                    "search the web FIRST — absence from your knowledge is NOT proof it "
+                    "doesn't exist.\n"
                     "Use run_code to execute Python for ANY arithmetic, calculation, "
                     "enumeration, or multi-step computation — never compute in your head.\n"
                     "If the user's message contains an [Example] block about a DIFFERENT "
@@ -486,7 +499,7 @@ async def process_query_stream(
             f"{match['answer']}\n\n"
             f"{user_query}"
         )})
-        answer = await call_cheap(messages, tools=None, reasoning=True)
+        answer = await call_cheap(messages, temperature=0.3, tools=None, reasoning=True)
 
         if _is_rejection(answer):
             rejected_match = match
