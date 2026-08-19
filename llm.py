@@ -133,6 +133,111 @@ def _deliver_generated_image(result: dict) -> str:
     return f"Image: {url}\nModel: {model}"
 
 
+# ── File delivery (send_file tool) ────────────────────────────────
+#
+# Same pattern as images: send_file self-delivers to the bound target.
+#   * telegram → document sent to the chat via sendDocument (before the reply)
+#   * web/api  → uploaded for a download URL; the model relays the URL in
+#                its text answer
+#   * no ctx   → saved to a local temp file (shouldn't happen in prod paths)
+
+ALLOWED_FILE_EXTS = {"txt", "md", "csv", "json", "log", "yaml", "yml", "py", "ini", "cfg"}
+MAX_FILE_BYTES = 300_000
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Force a safe bare filename with an allowed extension (defaults to .md)."""
+    name = os.path.basename(filename.strip().replace("\\", "/")) or "file"
+    name = name.strip()
+    if name.lower().endswith(tuple(f".{e}" for e in ALLOWED_FILE_EXTS)):
+        return name
+    return f"{os.path.splitext(name)[0] or 'file'}.md"
+
+
+def _send_telegram_document(chat_id: int, token: str, filename: str, content: str) -> tuple[bool, str]:
+    """Send a text file to a Telegram chat via sendDocument (multipart). Returns (ok, detail)."""
+    try:
+        data_bytes = content.encode("utf-8")
+        with httpx.Client(timeout=60) as c:
+            r = c.post(
+                f"https://api.telegram.org/bot{token}/sendDocument",
+                data={"chat_id": str(chat_id)},
+                files={"document": (filename, data_bytes, "text/plain; charset=utf-8")},
+            )
+        resp = r.json()
+        if r.status_code == 200 and resp.get("ok"):
+            return True, ""
+        return False, f"{r.status_code}: {str(resp)[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _upload_file_for_url(filename: str, content: str) -> str:
+    """Upload a text file to the local upload service, returning its download URL ('' on failure)."""
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=os.path.splitext(filename)[1] or ".txt", delete=False
+        ) as f:
+            f.write(content.encode("utf-8"))
+            tmp_path = f.name
+        p = subprocess.run(
+            ["curl", "-s", "-m", "20", "http://localhost:8000/upload/file",
+             "-H", "Authorization: Bearer 987654321",
+             "-F", f"file=@{tmp_path};filename={filename}"],
+            capture_output=True, text=True, timeout=25,
+        )
+        up = json.loads(p.stdout)
+        return up.get("download_url") or ""
+    except Exception:
+        return ""
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+
+
+def _send_file_impl(filename: str, content: str) -> str:
+    """Send a text file to the user (e.g. .txt, .md, .csv, .json) so they can store or copy it.
+
+Use this whenever the user asks to send, save, export, or download content as a file
+(e.g. \"send this as a .md file\", \"save this as notes.txt\"). Pass the COMPLETE file
+content and a suitable filename — never truncate the content.
+    """
+    filename = _sanitize_filename(filename)
+    if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+        return (
+            f"File too large ({len(content)} chars, max {MAX_FILE_BYTES}). "
+            f"Split it into smaller parts or shorten the content."
+        )
+    ctx = _delivery_ctx.get()
+    if ctx and ctx.get("platform") == "telegram" and ctx.get("chat_id"):
+        ok, detail = _send_telegram_document(ctx["chat_id"], ctx["token"], filename, content)
+        if ok:
+            return f"File sent to the chat: {filename}"
+        return f"File ready but Telegram delivery failed ({detail})."
+    if ctx and ctx.get("platform") == "web":
+        url = _upload_file_for_url(filename, content)
+        if url:
+            return f"File saved. Download: {url}"
+        return "File ready but upload failed — paste the content directly in your reply."
+    with tempfile.NamedTemporaryFile(
+        suffix=os.path.splitext(filename)[1] or ".txt", delete=False
+    ) as f:
+        f.write(content.encode("utf-8"))
+        return f"File saved to {f.name} (no delivery target)."
+
+
+send_file = function_tool(_send_file_impl, name_override="send_file")
+
+# Appended to every agent's instructions so models reach for send_file when the
+# user asks for a file (models otherwise default to printing content as text).
+_FILE_TOOL_HINT = (
+    "\n\nIf the user asks you to send, save, export, or download content as a file "
+    "(.txt, .md, .csv, .json, etc.), call the send_file tool with the COMPLETE file "
+    "content and a suitable filename — do not just print the content as text."
+)
+
+
 # ── Tool implementations ──────────────────────────────────────────
 
 SEARXNG_URL = "http://127.0.0.1:8080/search?format=json"
@@ -361,7 +466,7 @@ def edit_image(image_url: str, prompt: str) -> str:
         return f"Image edit failed: {e}"
 
 
-ALL_TOOLS = [web_search, web_fetch, youtube_transcript, run_code, generate_graph, generate_image, edit_image]
+ALL_TOOLS = [web_search, web_fetch, youtube_transcript, run_code, generate_graph, generate_image, edit_image, send_file]
 
 
 @function_tool
@@ -504,7 +609,11 @@ async def _run_cheap_agent(
 
     agent_kwargs = dict(
         name="LowCostLLM-Cheap",
-        instructions=system_prompt.strip() or "You are a helpful assistant. Use web_search to find current information whenever needed.",
+        instructions=(
+            system_prompt.strip()
+            or "You are a helpful assistant. Use web_search to find current information whenever needed."
+        )
+        + _FILE_TOOL_HINT,
         tools=use_tools,
         model=sdk_model,
     )
@@ -689,7 +798,8 @@ async def _call_expensive_with_client(
 
     agent_kwargs = dict(
         name="LowCostLLM-Expensive",
-        instructions=system_prompt.strip() or "You are a helpful assistant with web search and browsing tools.",
+        instructions=(system_prompt.strip() or "You are a helpful assistant with web search and browsing tools.")
+        + _FILE_TOOL_HINT,
         tools=ALL_TOOLS,
         model=sdk_model,
     )
