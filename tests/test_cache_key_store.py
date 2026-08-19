@@ -96,14 +96,58 @@ def test_store_uses_anchored_rewrite():
     )
 
 
-def test_referential_query_never_stored():
+def test_referential_with_resolved_key_is_stored():
+    """Deictic follow-up whose rewrite RESOLVES it → stored under the key."""
     captured = {}
 
     async def fake_cache_lookup(q, purpose="chat"):
-        raise AssertionError("referential queries must bypass the cache entirely")
+        return None  # resolved key doesn't hit yet → expensive path
+
+    async def fake_generate_search_query(q, turns):
+        return "Lantern TV series episode 3 The Mirror plot and details"
 
     async def fake_expensive(messages):
-        return "the fifth point is... " * 10, "deepseek-v4-pro"
+        return "Episode 3, The Mirror, is about... " * 10, "deepseek-v4-pro"
+
+    def fake_upsert_qa(query, answer, model, purpose="chat"):
+        captured["query"] = query
+        return 999
+
+    def fake_record(**kw):
+        pass
+
+    async def _run():
+        return await processor.process_query(
+            user_query="number 3",
+            chat_history=HISTORY,
+        )
+
+    with mock.patch.object(processor, "cache_lookup", fake_cache_lookup), \
+         mock.patch.object(processor, "generate_search_query", fake_generate_search_query), \
+         mock.patch.object(processor, "call_expensive", fake_expensive), \
+         mock.patch.object(processor, "upsert_qa", fake_upsert_qa), \
+         mock.patch.object(processor, "record_request", fake_record), \
+         mock.patch.object(processor, "_clear_generated_images", lambda: None), \
+         mock.patch.object(processor, "_get_generated_images", lambda: []):
+        asyncio.run(_run())
+
+    assert captured["query"] == "Lantern TV series episode 3 The Mirror plot and details", (
+        f"resolved referential key must be stored, got {captured.get('query')!r}"
+    )
+
+
+def test_referential_with_unresolved_key_not_stored():
+    """Deictic follow-up whose rewrite FAILED (key == raw) → never stored."""
+    captured = {}
+
+    async def fake_cache_lookup(q, purpose="chat"):
+        return None
+
+    async def fake_generate_search_query(q, turns):
+        return "number 3"  # failed rewrite — still deictic
+
+    async def fake_expensive(messages):
+        return "The third item is... " * 10, "deepseek-v4-pro"
 
     def fake_upsert_qa(query, answer, model, purpose="chat"):
         captured["query"] = query  # must never fire
@@ -114,11 +158,12 @@ def test_referential_query_never_stored():
 
     async def _run():
         return await processor.process_query(
-            user_query="number 5",
+            user_query="number 3",
             chat_history=HISTORY,
         )
 
     with mock.patch.object(processor, "cache_lookup", fake_cache_lookup), \
+         mock.patch.object(processor, "generate_search_query", fake_generate_search_query), \
          mock.patch.object(processor, "call_expensive", fake_expensive), \
          mock.patch.object(processor, "upsert_qa", fake_upsert_qa), \
          mock.patch.object(processor, "record_request", fake_record), \
@@ -127,7 +172,7 @@ def test_referential_query_never_stored():
         asyncio.run(_run())
 
     assert "query" not in captured, (
-        f"referential answer must not be cached, got {captured.get('query')!r}"
+        f"unresolved referential key must not be cached, got {captured.get('query')!r}"
     )
 
 
@@ -178,7 +223,8 @@ def main():
         test_search_key_prompt_injects_today_and_temp0,
         test_search_key_fallback_keeps_urls,
         test_store_uses_anchored_rewrite,
-        test_referential_query_never_stored,
+        test_referential_with_resolved_key_is_stored,
+        test_referential_with_unresolved_key_not_stored,
         test_store_fallback_to_raw_when_key_empty,
     ]
     failed = 0

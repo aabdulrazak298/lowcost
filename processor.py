@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 
 _TODAY = _dt.datetime.now().strftime("%A, %d %B %Y")
 _DATE_CONTEXT = f"Today's date is {_TODAY}. Use this for any time-sensitive context."
+_CACHE_AWARE_PROMPT = (
+    "Your answer may be cached and reused as a reference for similar future "
+    "queries. Be thorough, self-contained, and include all relevant details so "
+    "the cached version stands alone as a complete reference."
+)
 
 
 def history_to_turns(chat_history) -> list[dict]:
@@ -308,6 +313,11 @@ def _is_transient_failure(answer: str | None) -> bool:
     return a.startswith("(error") or a.startswith("(no response")
 
 
+def _normalize(text: str) -> str:
+    """Canonical form for key comparisons: lowercase, whitespace-collapsed."""
+    return " ".join((text or "").lower().split())
+
+
 # ── Cache policy: what is worth caching at all ──────────────────────
 
 _UNCACHEABLE_MARKERS = (
@@ -461,10 +471,9 @@ async def process_query(
     turns = history_to_turns(chat_history)
 
     rejected_match = None
-    # The cache key used for storage on the expensive path. Defaults to the raw
-    # query; the semantic branch overwrites it with the anchored rewrite
-    # ("this month" → "August 2026") so the STORED key carries absolute dates.
     match_query = user_query
+    # Deictic follow-up? The rewrite resolves it from history into a
+    # self-contained key; storage is guarded (only when resolution succeeded).
     referential = _is_referential(user_query) and turns
 
     if AGENTIC_CACHE:
@@ -477,26 +486,19 @@ async def process_query(
             return answer, model_used, _get_generated_images(), usage
         match = None
     else:
-        # Referential follow-up ("number 5")? Its meaning lives in the thread,
-        # not in any cached Q&A — skip the cache and let the expensive model
-        # answer from full history.
-        if referential:
-            record_request(hit=False, model="referential-bypass")
+        match = _lookup_exact_video(user_query)
+        if match is not None:
             logger.info(
-                "cache verdict=SKIP source=referential query=%r", user_query[:80],
+                "cache verdict=HIT source=g0 age_days=%s query=%r matched=%r",
+                age_days(match.get("created_at")),
+                user_query[:80], match["query"][:80],
             )
-            match = None
-        else:
-            match = _lookup_exact_video(user_query)
-            if match is not None:
-                logger.info(
-                    "cache verdict=HIT source=g0 age_days=%s query=%r matched=%r",
-                    age_days(match.get("created_at")),
-                    user_query[:80], match["query"][:80],
-                )
-            if match is None:
-                match_query = await generate_search_query(user_query, turns)
-                match = await cache_lookup(match_query) if match_query else None
+        if match is None:
+            # The rewrite resolves pronouns/implicit refs from history AND
+            # anchors dates — deictic follow-ups ("number 3") become
+            # self-contained keys here (was: referential bypass).
+            match_query = await generate_search_query(user_query, turns)
+            match = await cache_lookup(match_query) if match_query else None
 
     if match:
         # --- CHEAP PATH: history replayed as turns, cached answer as EXAMPLE ---
@@ -569,7 +571,7 @@ async def process_query(
             return answer, model_used, _get_generated_images(), usage
 
     # --- EXPENSIVE PATH: history replayed as turns, no cache blob ---
-    messages = [{"role": "system", "content": _DATE_CONTEXT}]
+    messages = [{"role": "system", "content": f"{_DATE_CONTEXT}\n{_CACHE_AWARE_PROMPT}"}]
     messages.extend(turns[-16:])
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -577,9 +579,11 @@ async def process_query(
     answer, model_used = await call_expensive(messages)
     usage = get_last_usage()
     # Store the anchored rewrite as the cache key (absolute dates, URL kept).
-    # Referential answers are context-dependent — never cached globally.
-    if not referential:
-        cache_store(match_query or user_query, answer, model_used, decision_query=user_query)
+    # Referential keys are stored ONLY when the rewrite resolved them (key ≠
+    # raw) — a failed rewrite would leave a context-dependent key in the cache.
+    store_key = match_query or user_query
+    if not referential or _normalize(store_key) != _normalize(user_query):
+        cache_store(store_key, answer, model_used, decision_query=user_query)
     record_request(hit=False, model=model_used)
 
     # Curator: if we rejected a cached candidate, let the expensive model
@@ -607,6 +611,7 @@ async def process_query_stream(
 
     rejected_match = None
     # Anchored rewrite is the stored cache key; defaults to the raw query.
+    # Deictic follow-ups are resolved from history; storage guarded below.
     match_query = user_query
     referential = _is_referential(user_query) and turns
 
@@ -715,7 +720,7 @@ async def process_query_stream(
             return model_used, _get_generated_images()
 
     # Expensive path with streaming
-    messages = [{"role": "system", "content": _DATE_CONTEXT}]
+    messages = [{"role": "system", "content": f"{_DATE_CONTEXT}\n{_CACHE_AWARE_PROMPT}"}]
     messages.extend(turns[-16:])
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -725,9 +730,11 @@ async def process_query_stream(
     answer, model_used = await call_expensive_stream(messages, callback)
     logger.info(f"Streaming complete: {len(answer)} chars, model={model_used}")
     # Store the anchored rewrite as the cache key (absolute dates, URL kept).
-    # Referential answers are context-dependent — never cached globally.
-    if not referential:
-        cache_store(match_query or user_query, answer, model_used, decision_query=user_query)
+    # Referential keys are stored ONLY when the rewrite resolved them (key ≠
+    # raw) — a failed rewrite would leave a context-dependent key in the cache.
+    store_key = match_query or user_query
+    if not referential or _normalize(store_key) != _normalize(user_query):
+        cache_store(store_key, answer, model_used, decision_query=user_query)
     record_request(hit=False, model=model_used)
 
     # Curator: if we rejected a cached candidate, let the expensive model
