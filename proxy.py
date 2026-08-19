@@ -4,7 +4,7 @@ import logging
 import time
 
 from config import get_cheap_model
-from db import cache_lookup, insert_qa
+from db import cache_lookup, upsert_qa
 from llm import (
     call_cheap,
     call_expensive,
@@ -14,7 +14,7 @@ from llm import (
     get_last_usage,
 )
 from stats import record_request
-from processor import _is_rejection
+from processor import _is_rejection, should_cache
 
 logger = logging.getLogger("lowcostllm.chat")
 
@@ -178,7 +178,8 @@ async def handle_chat_completion(body: dict) -> dict:
         usage = result.get("usage")
         finish_reason = result.get("finish_reason", "stop")
 
-        insert_qa(match_query, response_content, model_used)
+        if should_cache(user_query, response_content):
+            upsert_qa(match_query, response_content, model_used)
         _record(hit=False, model=model_used, usage=usage)
 
     response = {
@@ -334,7 +335,8 @@ async def stream_chat_completion(body: dict):
         yield "data: [DONE]\n\n"
 
         if full_text:
-            insert_qa(match_query, full_text, model_used)
+            if should_cache(user_query, full_text):
+                upsert_qa(match_query, full_text, model_used)
         _record(hit=False, model=model_used, usage=usage)
 
     except Exception as e:

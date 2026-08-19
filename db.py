@@ -1,10 +1,14 @@
 """SQLite cache for Q&A pairs + conversation memory."""
 import asyncio
+import logging
+import re
 import sqlite3
 import threading
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from config import CACHE_MAX_ENTRIES, CACHE_TTL_DAYS, DB_PATH
+
+logger = logging.getLogger(__name__)
 
 _conn_local = threading.local()
 _hot_cache: OrderedDict[str, dict] = OrderedDict()
@@ -180,6 +184,67 @@ def insert_qa(query: str, answer: str, model_used: str, purpose: str = "chat") -
     return rid
 
 
+_VIDEO_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})"
+)
+
+
+def _normalize_query(query: str) -> str:
+    """Canonical form for duplicate detection: lowercase, whitespace-collapsed."""
+    return " ".join((query or "").lower().split())
+
+
+def _video_ids_in(query: str) -> list[str]:
+    """Unique YouTube video IDs referenced in a query."""
+    return list(dict.fromkeys(_VIDEO_ID_RE.findall(query or "")))
+
+
+def _refresh_row(rid: int, query: str, answer: str, model_used: str, conn) -> int:
+    """Update an existing cache row in place (FTS stays in sync via trigger)."""
+    conn.execute(
+        "UPDATE qa_cache SET query=?, answer=?, model_used=?, "
+        "created_at=datetime('now'), last_accessed=datetime('now') WHERE id=?",
+        (query, answer, model_used, rid),
+    )
+    conn.commit()
+    return rid
+
+
+def upsert_qa(query: str, answer: str, model_used: str, purpose: str = "chat") -> int:
+    """Insert a Q&A pair, deduping against an existing active row.
+
+    One row per distinct question (write-side dedupe):
+      1. same normalized query  -> UPDATE in place (refreshes answer + timestamps)
+      2. same YouTube video ID  -> UPDATE in place (catches wording variants
+         like "summaries <url>" vs "summarise <url>")
+      3. otherwise              -> plain INSERT
+
+    Fixes the 2026-08-18 duplicate-rows bug: a cache hit whose cheap step
+    failed (429 window) escalated to the expensive path and inserted a fresh
+    copy of an identical query. Repeated asks now refresh instead of stacking.
+    Returns the row id (existing or new).
+    """
+    conn = get_conn()
+    norm = _normalize_query(query)
+    if norm:
+        row = conn.execute(
+            "SELECT id FROM qa_cache WHERE lower(trim(query)) = ? AND purpose = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (norm, purpose),
+        ).fetchone()
+        if row:
+            logger.info("upsert dedupe: same query → UPDATE row %d", row["id"])
+            return _refresh_row(row["id"], query, answer, model_used, conn)
+    for vid in _video_ids_in(query):
+        existing = lookup_by_video_id(vid, purpose)
+        if existing:
+            logger.info(
+                "upsert dedupe: same video id %s → UPDATE row %d", vid, existing["id"],
+            )
+            return _refresh_row(existing["id"], query, answer, model_used, conn)
+    return insert_qa(query, answer, model_used, purpose)
+
+
 _FTS_STOP_WORDS = frozenset({
     # articles / determiners
     "a", "an", "the", "this", "that", "these", "those",
@@ -351,6 +416,7 @@ async def cache_lookup(match_query: str, purpose: str = "chat") -> dict | None:
 
     hot = await hot_cache_lookup(match_query, purpose)
     if hot:
+        logger.info("cache verdict=HIT source=hot query=%r", match_query[:80])
         return hot
 
     match = await smart_cache_lookup(match_query, purpose)

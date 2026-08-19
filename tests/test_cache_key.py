@@ -35,9 +35,9 @@ def test_store_key_is_current_query_only():
         return None  # force a miss → expensive path
 
     async def fake_expensive(messages):
-        return "fresh answer", "deepseek-v4-pro"
+        return "fresh answer " * 40, "deepseek-v4-pro"
 
-    def fake_insert_qa(query, answer, model, purpose="chat"):
+    def fake_upsert_qa(query, answer, model, purpose="chat"):
         captured["query"] = query
         captured["answer"] = answer
         captured["model"] = model
@@ -54,7 +54,7 @@ def test_store_key_is_current_query_only():
 
     with mock.patch.object(processor, "cache_lookup", fake_cache_lookup), \
          mock.patch.object(processor, "call_expensive", fake_expensive), \
-         mock.patch.object(processor, "insert_qa", fake_insert_qa), \
+         mock.patch.object(processor, "upsert_qa", fake_upsert_qa), \
          mock.patch.object(processor, "record_request", fake_record), \
          mock.patch.object(processor, "_clear_generated_images", lambda: None), \
          mock.patch.object(processor, "_get_generated_images", lambda: []):
@@ -63,7 +63,7 @@ def test_store_key_is_current_query_only():
     assert captured["query"] == CURRENT_QUERY, (
         f"stored key must be the current query only, got {captured['query']!r}"
     )
-    assert captured["answer"] == "fresh answer"
+    assert captured["answer"] == "fresh answer " * 40
     assert captured["model"] == "deepseek-v4-pro"
 
 
@@ -76,9 +76,9 @@ def test_store_key_is_current_query_only_stream():
         return None
 
     async def fake_expensive_stream(messages, callback):
-        return "fresh answer", "deepseek-v4-pro"
+        return "fresh answer " * 40, "deepseek-v4-pro"
 
-    def fake_insert_qa(query, answer, model, purpose="chat"):
+    def fake_upsert_qa(query, answer, model, purpose="chat"):
         captured["query"] = query
         return 999
 
@@ -94,7 +94,7 @@ def test_store_key_is_current_query_only_stream():
 
     with mock.patch.object(processor, "cache_lookup", fake_cache_lookup), \
          mock.patch.object(processor, "call_expensive_stream", fake_expensive_stream), \
-         mock.patch.object(processor, "insert_qa", fake_insert_qa), \
+         mock.patch.object(processor, "upsert_qa", fake_upsert_qa), \
          mock.patch.object(processor, "record_request", fake_record), \
          mock.patch.object(processor, "_clear_generated_images", lambda: None), \
          mock.patch.object(processor, "_get_generated_images", lambda: []):

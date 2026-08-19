@@ -9,7 +9,7 @@ import logging
 import re as _re
 import urllib.request
 from config import get_cheap_model, AGENTIC_CACHE
-from db import cache_lookup, insert_qa, increment_hit_count
+from db import cache_lookup, upsert_qa, increment_hit_count
 from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images, get_last_usage
 from stats import record_request, record_irrelevant_escalation
 from curator import run_curator
@@ -191,6 +191,9 @@ async def generate_search_query(user_query: str, turns: list[dict]) -> str:
     try:
         refs, ok = await asyncio.to_thread(_resolve_references, user_query)
         if not ok:
+            logger.info(
+                "cache verdict=SKIP source=unresolvable-link query=%r", user_query[:80],
+            )
             return ""
 
         history = turns_to_string(turns[-12:])
@@ -278,6 +281,69 @@ def _is_rejection(answer: str) -> bool:
     return any(p in head for p in _REJECTION_PHRASES)
 
 
+def _is_transient_failure(answer: str | None) -> bool:
+    """True when the cheap model failed TRANSIENTLY (provider 429/5xx/timeout).
+
+    An empty or "(error: ...)" answer is NOT a relevance verdict — the model
+    never got to judge the cached example. Treating it as IRRELEVANT was the
+    2026-08-18 duplicate-insert bug: hit → cheap failure → escalate →
+    expensive re-answer → duplicate cache row.
+    """
+    if not answer:
+        return True
+    a = answer.strip().lower()
+    if not a:
+        return True
+    return a.startswith("(error") or a.startswith("(no response")
+
+
+# ── Cache policy: what is worth caching at all ──────────────────────
+
+_UNCACHEABLE_MARKERS = (
+    # IDE/agent system chatter leaked through the OpenAI-compat path
+    "added these files",
+    "trust this message",
+    "working with you on code",
+    "don't consider the above files",
+    "switched to a new code base",
+    "true contents of the files",
+)
+
+_UNCACHEABLE_RES = (
+    # tool-directive test prompts ("Use the get_weather tool.")
+    _re.compile(r"use the [a-z_]+ tool", _re.I),
+    # chart prompts that embed their own data — the answer embeds the same
+    # data, so the cached copy has zero reuse value for any future query.
+    _re.compile(r"\bchart of\b", _re.I),
+    _re.compile(r"\bplot a\b.{0,40}\b(chart|graph)\b", _re.I),
+)
+
+
+def should_cache(user_query: str, answer: str) -> bool:
+    """True if this Q&A pair is worth caching.
+
+    Skips: IDE/agent system chatter, tool-directive prompts, chart-data
+    prompts, and trivial exchanges (short query + tiny answer). These were
+    measured as the never-hit majority of qa_cache (65/91 entries, 71%).
+    """
+    q = (user_query or "").strip()
+    a = (answer or "").strip()
+    if not q or not a:
+        return False
+    ql = q.lower()
+    if any(m in ql for m in _UNCACHEABLE_MARKERS):
+        return False
+    if any(rx.search(ql) for rx in _UNCACHEABLE_RES):
+        return False
+    # Trivial exchanges — but a URL query is never trivial: "summaries <url>"
+    # is 2 split() words yet a legitimate summarise request.
+    if "http" not in ql and len(q.split()) <= 3 and len(a) < 200:
+        return False
+    if len(a) < 40 and len(q.split()) <= 10:
+        return False
+    return True
+
+
 def _is_escalate(answer: str) -> bool:
     """True if the cheap model asked to escalate (no usable cache match)."""
     if not answer:
@@ -355,9 +421,17 @@ async def process_query(
         # answer from full history.
         if _is_referential(user_query) and turns:
             record_request(hit=False, model="referential-bypass")
+            logger.info(
+                "cache verdict=SKIP source=referential query=%r", user_query[:80],
+            )
             match = None
         else:
             match = _lookup_exact_video(user_query)
+            if match is not None:
+                logger.info(
+                    "cache verdict=HIT source=g0 query=%r matched=%r",
+                    user_query[:80], match["query"][:80],
+                )
             if match is None:
                 match_query = await generate_search_query(user_query, turns)
                 match = await cache_lookup(match_query) if match_query else None
@@ -393,6 +467,27 @@ async def process_query(
             f"{user_query}"
         )})
         answer = await call_cheap(messages, temperature=0.3, tools=None, reasoning=True)
+
+        # Transient provider failure (429/5xx/timeout) is NOT a relevance
+        # verdict. Retry once; if still down, serve the cached example directly
+        # rather than escalating to an expensive re-answer (which was the
+        # 2026-08-18 duplicate-insert bug) or returning an error string.
+        if _is_transient_failure(answer):
+            logger.warning(
+                "cheap-path transient failure (retrying): query=%r", user_query[:120],
+            )
+            answer = await call_cheap(messages, temperature=0.3, tools=None, reasoning=True)
+            if _is_transient_failure(answer):
+                logger.warning(
+                    "cheap path still failing — serving cached example directly "
+                    "query=%r cached=%r",
+                    user_query[:120], match["query"][:120],
+                )
+                increment_hit_count(match["id"])
+                model_used = f"{get_cheap_model()} (cached-direct)"
+                record_request(hit=True, model=model_used)
+                return match["answer"], model_used, _get_generated_images(), get_last_usage()
+
         usage = get_last_usage()
 
         # Self-check: did the cheap model reject the cached answer?
@@ -419,7 +514,8 @@ async def process_query(
     messages.append({"role": "user", "content": user_query})
     answer, model_used = await call_expensive(messages)
     usage = get_last_usage()
-    insert_qa(user_query, answer, model_used)
+    if should_cache(user_query, answer):
+        upsert_qa(user_query, answer, model_used)
     record_request(hit=False, model=model_used)
 
     # Curator: if we rejected a cached candidate, let the expensive model
@@ -463,9 +559,17 @@ async def process_query_stream(
     else:
         if _is_referential(user_query) and turns:
             record_request(hit=False, model="referential-bypass")
+            logger.info(
+                "cache verdict=SKIP source=referential query=%r", user_query[:80],
+            )
             match = None
         else:
             match = _lookup_exact_video(user_query)
+            if match is not None:
+                logger.info(
+                    "cache verdict=HIT source=g0 query=%r matched=%r",
+                    user_query[:80], match["query"][:80],
+                )
             if match is None:
                 match_query = await generate_search_query(user_query, turns)
                 match = await cache_lookup(match_query) if match_query else None
@@ -501,6 +605,27 @@ async def process_query_stream(
         )})
         answer = await call_cheap(messages, temperature=0.3, tools=None, reasoning=True)
 
+        # Transient provider failure — retry once, then serve cached directly.
+        if _is_transient_failure(answer):
+            logger.warning(
+                "cheap-path transient failure (retrying): query=%r", user_query[:120],
+            )
+            answer = await call_cheap(messages, temperature=0.3, tools=None, reasoning=True)
+            if _is_transient_failure(answer):
+                logger.warning(
+                    "cheap path still failing — serving cached example directly "
+                    "query=%r cached=%r",
+                    user_query[:120], match["query"][:120],
+                )
+                increment_hit_count(match["id"])
+                model_used = f"{get_cheap_model()} (cached-direct)"
+                record_request(hit=True, model=model_used)
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(match["answer"])
+                else:
+                    callback(match["answer"])
+                return model_used, _get_generated_images()
+
         if _is_rejection(answer):
             rejected_match = match
             record_request(hit=False, model="irrelevant-escalated")
@@ -531,7 +656,8 @@ async def process_query_stream(
     logger.info(f"Starting streaming for query: {user_query[:80]}")
     answer, model_used = await call_expensive_stream(messages, callback)
     logger.info(f"Streaming complete: {len(answer)} chars, model={model_used}")
-    insert_qa(user_query, answer, model_used)
+    if should_cache(user_query, answer):
+        upsert_qa(user_query, answer, model_used)
     record_request(hit=False, model=model_used)
 
     # Curator: if we rejected a cached candidate, let the expensive model

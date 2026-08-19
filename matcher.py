@@ -111,6 +111,9 @@ async def smart_cache_lookup(match_query: str, purpose: str = "chat") -> dict | 
     # FTS5 pre-filter (lexical) — limits how many candidates we embed
     candidates = search_candidates(match_query, limit=20, purpose=purpose)
     if not candidates:
+        logger.info(
+            "cache verdict=MISS source=semantic candidates=0 query=%r", match_query[:80],
+        )
         return None
 
     # Without an embedding model we cannot do semantic matching. Return a
@@ -131,9 +134,10 @@ async def smart_cache_lookup(match_query: str, purpose: str = "chat") -> dict | 
 
         # Absolute relevance gate — on the RAW cosine, never a normalized one.
         if float(sem_scores.max()) < SEM_THRESHOLD:
-            logger.debug(
-                "Cache MISS: best raw cosine %.3f < %.3f query=%s",
-                float(sem_scores.max()), SEM_THRESHOLD, match_query[:60],
+            logger.info(
+                "cache verdict=MISS source=semantic best_cosine=%.3f threshold=%.2f "
+                "candidates=%d query=%r",
+                float(sem_scores.max()), SEM_THRESHOLD, len(candidates), match_query[:80],
             )
             return None
 
@@ -150,10 +154,11 @@ async def smart_cache_lookup(match_query: str, purpose: str = "chat") -> dict | 
         hybrid[sem_scores < SEM_THRESHOLD] = -np.inf
 
         best_idx = int(np.argmax(hybrid))
-        logger.debug(
-            "Cache HIT: raw cosine %.3f >= %.3f (hybrid %.3f) query=%s",
-            float(sem_scores[best_idx]), SEM_THRESHOLD,
-            float(hybrid[best_idx]), match_query[:60],
+        logger.info(
+            "cache verdict=HIT source=semantic cosine=%.3f hybrid=%.3f candidates=%d "
+            "query=%r matched=%r",
+            float(sem_scores[best_idx]), float(hybrid[best_idx]), len(candidates),
+            match_query[:80], candidates[best_idx].get("query", "")[:80],
         )
         return candidates[best_idx]
 

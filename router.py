@@ -15,7 +15,7 @@ from config import (
     STAGE_CONFIDENCE_THRESHOLD,
     STAGE_RECENT_TURN_WINDOW,
 )
-from db import cache_lookup, insert_qa
+from db import cache_lookup, upsert_qa
 from session import get_affinity, set_affinity, evict_stale
 from stage_router import detect_tool_loop, score_signals
 from stats import record_request
@@ -206,7 +206,7 @@ async def _stage_route(messages: list[dict], tools) -> tuple[dict, dict]:
 def _cache_fresh(result: dict, match_query: str, model_used: str) -> None:
     content = result["message"]["content"]
     if content.strip():
-        insert_qa(match_query, content, model_used, purpose="code")
+        upsert_qa(match_query, content, model_used, purpose="code")
 
 
 async def route_and_answer(
