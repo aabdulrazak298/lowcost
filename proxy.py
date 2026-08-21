@@ -14,7 +14,7 @@ from llm import (
     get_last_usage,
 )
 from stats import record_request
-from processor import _is_rejection, cache_store
+from processor import _is_rejection, cache_store, _relevance_gate, _reject_cache_hit
 
 logger = logging.getLogger("lowcostllm.chat")
 
@@ -100,6 +100,12 @@ async def handle_chat_completion(body: dict) -> dict:
     finish_reason = "stop"
     decision_source = "cache-miss"
     rationale = "no cache match"
+
+    # Relevance gatekeeper (semantic hits only; hot/G0 are exact matches).
+    # One cheap call filters on-topic-but-wrong-content hits before routing.
+    if match is not None and match.get("source") == "semantic" and not await _relevance_gate(user_query, match):
+        await _reject_cache_hit(match_query, user_query, match)
+        match = None
 
     if match:
         if tools:
@@ -254,6 +260,11 @@ async def stream_chat_completion(body: dict):
 
     match = await cache_lookup(match_query)
     decision_source = "cache-miss"
+
+    # Relevance gatekeeper (semantic hits only; hot/G0 are exact matches).
+    if match is not None and match.get("source") == "semantic" and not await _relevance_gate(user_query, match):
+        await _reject_cache_hit(match_query, user_query, match)
+        match = None
 
     if match:
         # Cache hit — buffer cheap response, verify IRRELEVANT, then stream.

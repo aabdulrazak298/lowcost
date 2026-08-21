@@ -18,15 +18,37 @@ from typing import Any
 
 import numpy as np
 
-from db import search_candidates, age_days
+from db import search_candidates, age_days, is_ephemeral_query
 
 logger = logging.getLogger(__name__)
+
+# ── Era gate ────────────────────────────────────────────────
+# MiniLM scores "top 10 baby names in the 1980s" ≈ "…in the 1990s" at ~0.84
+# — era qualifiers are invisible to cosine. If BOTH query and candidate
+# carry explicit decade/year tokens and their decade buckets are DISJOINT,
+# the answer is wrong data by definition: reject (never serve).
+
+_DECADE_RE = re.compile(r"\b(?:19|20)\d{2}s?\b")
+
+
+def _decade_buckets(text: str | None) -> set[int]:
+    """Decade buckets (floor(year/10)*10) for any years/decades in text.
+
+    "1980s" → {1980}; "1990" → {1990}; "2020 to 2024" → {2020}; none → {}.
+    """
+    out: set[int] = set()
+    for m in _DECADE_RE.findall(text or ""):
+        out.add((int(m[:4]) // 10) * 10)
+    return out
 
 # ── Embedding model (singleton, lazy-loaded) ──────────────────
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 DIM = 384
 SEM_THRESHOLD = float(os.environ.get("LCLLM_SEM_THRESHOLD", "0.45"))
+# Time-sensitive entries older than this are never served (stale by
+# definition — "latest news reports" from 4 days ago is not the latest).
+EPHEMERAL_TTL_HOURS = float(os.environ.get("EPHEMERAL_TTL_HOURS", "24"))
 CODE_LEXICON_FAST_PATH = os.environ.get("CODE_LEXICON_FAST_PATH", "1") == "1"
 
 _model: Any = None
@@ -329,14 +351,40 @@ async def smart_cache_lookup(match_query: str, purpose: str = "chat") -> dict | 
         created = [c.get("created_at") for c in candidates]
 
         best_idx, hybrid = _score_and_pick(sem_scores, fts5_raw, created, SEM_THRESHOLD)
+        best = candidates[best_idx]
+
+        # Era gate: disjoint decade/year buckets = wrong data, never serve.
+        q_dec = _decade_buckets(match_query)
+        c_dec = _decade_buckets(best.get("query", ""))
+        if q_dec and c_dec and q_dec.isdisjoint(c_dec):
+            logger.info(
+                "cache verdict=SKIP source=decade-mismatch query_decades=%s "
+                "cached_decades=%s query=%r matched=%r",
+                sorted(q_dec), sorted(c_dec), match_query[:80], best.get("query", "")[:80],
+            )
+            return None
+
+        # Freshness gate (read side): an ephemeral entry older than
+        # EPHEMERAL_TTL_HOURS is stale by definition — never serve it.
+        # (Hot-cache exact repeats are unaffected; this is semantic-only.)
+        if is_ephemeral_query(best.get("query", "")):
+            age_h = (age_days(created[best_idx]) or 0.0) * 24.0
+            if age_h > EPHEMERAL_TTL_HOURS:
+                logger.info(
+                    "cache verdict=SKIP source=ephemeral-stale age_hours=%.1f "
+                    "query=%r matched=%r",
+                    age_h, match_query[:80], best.get("query", "")[:80],
+                )
+                return None
+
         logger.info(
             "cache verdict=HIT source=semantic cosine=%.3f hybrid=%.3f candidates=%d "
             "age_days=%s query=%r matched=%r",
             float(sem_scores[best_idx]), float(hybrid[best_idx]), len(candidates),
             age_days(created[best_idx]),
-            match_query[:80], candidates[best_idx].get("query", "")[:80],
+            match_query[:80], best.get("query", "")[:80],
         )
-        return candidates[best_idx]
+        return best
 
     except Exception:
         logger.exception("Embedding scoring failed — treating as cache miss")

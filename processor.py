@@ -9,7 +9,7 @@ import logging
 import re as _re
 import urllib.request
 from config import get_cheap_model, AGENTIC_CACHE
-from db import cache_lookup, upsert_qa, increment_hit_count, age_days
+from db import cache_lookup, upsert_qa, increment_hit_count, age_days, is_ephemeral_query, hot_cache_delete
 from llm import call_cheap, call_expensive, call_expensive_stream, _clear_generated_images, _get_generated_images, _wait_for_images, get_last_usage
 from stats import record_request, record_irrelevant_escalation
 from curator import run_curator
@@ -98,6 +98,28 @@ _YT_KEY = "987654321"
 
 def _extract_urls(text: str) -> list[str]:
     return _URL_RE.findall(text or "")
+
+
+_MEDIA_SUMMARY_RE = _re.compile(
+    r"(?i)\b(summar\w*|recap\w*|tldr)\b.{0,80}\b(video|youtube|documentary|podcast)\b"
+    r"|\b(video|youtube|documentary|podcast)\b.{0,40}\b(summar\w*|recap\w*)\b"
+)
+
+
+def _is_media_summary_no_url(user_query: str) -> bool:
+    """True for a media-summary request that carries NO URL to anchor the key.
+
+    Without a URL/video-ID the rewritten key is just the template
+    ("summarize the YouTube video X by Y") — it matches ANY other video's
+    summary above the cosine gate and serves the WRONG video's content
+    (measured 2026-08-21: FBI LETTERS ↔ VDH video @0.453, LedgerHQ ↔ Julia
+    McCoy @0.619, Varoufakis ↔ Sean Foo @0.537). Media-by-title requests
+    therefore skip the cache entirely — the fresh answer is served and the
+    template key never pollutes the cache. Requests WITH a URL are
+    unaffected (exact-video G0 hit or URL-anchored key).
+    """
+    q = user_query or ""
+    return bool(_MEDIA_SUMMARY_RE.search(q)) and not _extract_urls(q)
 
 
 def _is_youtube(url: str) -> bool:
@@ -219,6 +241,11 @@ async def generate_search_query(user_query: str, turns: list[dict]) -> str:
                 "cache verdict=SKIP source=unresolvable-link query=%r", user_query[:80],
             )
             return ""
+        if not refs and _is_media_summary_no_url(user_query):
+            logger.info(
+                "cache verdict=SKIP source=media-no-url query=%r", user_query[:80],
+            )
+            return ""
 
         history = turns_to_string(turns[-12:])
         parts = []
@@ -334,6 +361,104 @@ def _normalize(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
+# ── Relevance gatekeeper (chat cache hits) ────────────────────────
+#
+# Mirrors the code path's p_solve judge (code_proxy._judge): ONE cheap call
+# filters whether the matched cache entry is actually on-topic for the user's
+# question BEFORE the answer call builds on it. The deterministic gates
+# (threshold, ephemeral, decade, media-no-URL) run first for free; this is
+# the final precision filter for SEMANTIC hits. Hot-cache and exact-video
+# (G0) hits are exact matches and skip the gate.
+
+_GATEKEEPER_PROMPT = (
+    "You are a relevance gatekeeper for a chat cache.\n\n"
+    "You are given:\n"
+    "1. A CACHED question and its CACHED answer (from an earlier exchange).\n"
+    "2. The user's NEW question.\n\n"
+    "Decide whether the cached answer is ON-TOPIC for the new question — i.e. "
+    "it can serve as a useful foundation (facts, structure, style) for answering "
+    "it. Content-level mismatch means NO: different subject, different video or "
+    "article, different entities, different era/date. Same topic rephrased or "
+    "followed up means YES.\n\n"
+    "Reply with exactly one word: YES or NO.\n\n"
+    "CACHED question:\n{cached_q}\n\n"
+    "CACHED answer:\n{cached_a}\n\n"
+    "NEW question:\n{new_q}"
+)
+
+_GATEKEEPER_MAX_TOKENS = 32
+_GATEKEEPER_TEMPERATURE = 0.0
+
+
+def _parse_gate_verdict(content: str | None) -> bool | None:
+    """True=serve cache, False=miss (expensive), None=unparseable."""
+    if not content or not content.strip():
+        return None
+    first = content.strip().split()[0].upper().rstrip(".,!?")
+    if first == "YES":
+        return True
+    if first == "NO":
+        return False
+    return None
+
+
+async def _relevance_gate(user_query: str, match: dict) -> bool:
+    """One cheap call: is the cached entry on-topic for the user's question?
+
+    Returns True (serve cache) / False (miss -> expensive path). On any
+    failure or unparseable verdict the gate FAILS CLOSED (False) — the same
+    conservative default as the code path's judge-parse-failure fallback.
+    """
+    from llm import call_cheap_raw
+
+    cached_q = (match.get("query") or "")[:300]
+    cached_a = (match.get("answer") or "")[:1500]
+    prompt = _GATEKEEPER_PROMPT.format(
+        cached_q=cached_q, cached_a=cached_a, new_q=(user_query or "")[:500],
+    )
+    try:
+        resp, model = await call_cheap_raw(
+            [{"role": "user", "content": prompt}],
+            temperature=_GATEKEEPER_TEMPERATURE,
+            max_tokens=_GATEKEEPER_MAX_TOKENS,
+            extra_body={"reasoning": {"enabled": False}},
+        )
+        content = resp.choices[0].message.content or ""
+    except Exception:
+        logger.warning(
+            "cache gatekeeper call failed — fail closed (miss): query=%r matched=%r",
+            (user_query or "")[:80], (match.get("query") or "")[:80],
+        )
+        return False
+    verdict = _parse_gate_verdict(content)
+    if verdict is None:
+        logger.info(
+            "cache gatekeeper parse failure raw=%r — fail closed (miss)",
+            content[:120],
+        )
+        return False
+    logger.info(
+        "cache gatekeeper verdict=%s model=%s query=%r matched=%r",
+        "serve" if verdict else "reject",
+        model, (user_query or "")[:80], cached_q[:80],
+    )
+    return verdict
+
+
+async def _reject_cache_hit(match_query: str, user_query: str, match: dict) -> None:
+    """Log + evict a gate-rejected semantic hit.
+
+    cache_lookup hot-caches semantic matches BEFORE the gate runs, so a
+    rejected match would otherwise be re-served un-gated on the next identical
+    ask. Evicting closes that hole.
+    """
+    logger.info(
+        "cache verdict=SKIP source=gatekeeper query=%r matched=%r",
+        user_query[:80], (match.get("query") or "")[:80],
+    )
+    await hot_cache_delete(match_query)
+
+
 # ── Cache policy: what is worth caching at all ──────────────────────
 
 _UNCACHEABLE_MARKERS = (
@@ -382,26 +507,13 @@ def should_cache(user_query: str, answer: str) -> bool:
     return True
 
 
-# ── Freshness instrumentation (step 1 of recency plan — measurement only) ──
-
-_EPHEMERAL_RE = _re.compile(
-    r"\b(latest|breaking|news|today|weather|forecast|price|stock|election|current|recent|update)\b"
-    r"|\bthis (month|week|year|quarter)\b"
-    r"|\b(as of|right now)\b",
-    _re.I,
-)
-
-
-def is_ephemeral_query(user_query: str) -> bool:
-    """True if the query is time-sensitive and its answer goes stale fast.
-
-    Measured offenders: "how many disasters ... this month alone?", "latest
-    worldwide news reports", "is earthquake this year still common". NOTE: this
-    is a heuristic — implicit time-sensitivity ("tell me more about hurricane
-    lala") is missed; an LLM-assisted classifier is the follow-up (Gemini
-    review, 2026-08-19). Used for WRITE-TIME classification + counting only.
-    """
-    return bool(_EPHEMERAL_RE.search(user_query or ""))
+# ── Freshness enforcement ──────────────────────────────────
+#
+# is_ephemeral_query() lives in db.py (shared with matcher.py's read-side
+# gate). Here it gates WRITES: time-sensitive answers ("latest news",
+# "this month") are never stored long-term — a cached news answer is stale
+# the moment it's written. Exact repeats within a session still hit the
+# hot cache, so nothing is lost for quick re-asks.
 
 
 def cache_store(
@@ -421,8 +533,10 @@ def cache_store(
     dq = decision_query if decision_query is not None else store_query
     if not should_cache(dq, answer):
         return
-    kind = "ephemeral" if is_ephemeral_query(dq) else "evergreen"
-    logger.info("cache write kind=%s query=%r", kind, store_query[:80])
+    if is_ephemeral_query(dq):
+        logger.info("cache write kind=ephemeral skip-store query=%r", store_query[:80])
+        return
+    logger.info("cache write kind=evergreen query=%r", store_query[:80])
     upsert_qa(store_query, answer, model_used, purpose)
 
 
@@ -516,6 +630,12 @@ async def process_query(
             # self-contained keys here (was: referential bypass).
             match_query = await generate_search_query(user_query, turns)
             match = await cache_lookup(match_query) if match_query else None
+        # Relevance gatekeeper: one cheap call filters semantic hits that are
+        # on-topic but wrong content (different video/subject/era). Fail
+        # closed -> expensive path.
+        if match is not None and match.get("source") == "semantic" and not await _relevance_gate(user_query, match):
+            await _reject_cache_hit(match_query, user_query, match)
+            match = None
 
     if match:
         # --- CHEAP PATH: history replayed as turns, cached answer as EXAMPLE ---
@@ -667,6 +787,11 @@ async def process_query_stream(
             if match is None:
                 match_query = await generate_search_query(user_query, turns)
                 match = await cache_lookup(match_query) if match_query else None
+            # Relevance gatekeeper (same as process_query): semantic hits are
+            # filtered by one cheap on-topic call before the cheap path.
+            if match is not None and match.get("source") == "semantic" and not await _relevance_gate(user_query, match):
+                await _reject_cache_hit(match_query, user_query, match)
+                match = None
 
     if match:
         messages = [

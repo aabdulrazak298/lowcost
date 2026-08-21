@@ -8,6 +8,28 @@ from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from config import CACHE_MAX_ENTRIES, CACHE_TTL_DAYS, DB_PATH
 
+# ── Freshness classification (shared: write-gate in processor, read-gate in matcher) ──
+
+_EPHEMERAL_RE = re.compile(
+    r"\b(latest|breaking|news|today|weather|forecast|price|stock|election|current|recent|update)\b"
+    r"|\bthis (month|week|year|quarter)\b"
+    r"|\b(as of|right now)\b",
+    re.I,
+)
+
+
+def is_ephemeral_query(user_query: str | None) -> bool:
+    """True if the query is time-sensitive and its answer goes stale fast.
+
+    Measured offenders: "how many disasters ... this month alone?", "latest
+    worldwide news reports", "is earthquake this year still common". URLs are
+    stripped BEFORE matching so a link-verification request ("verify this
+    https://abc.net.au/news/...") is not misclassified by a "news" token
+    inside the URL — the article's content does not go stale.
+    """
+    text = re.sub(r"https?://\S+", "", user_query or "")
+    return bool(_EPHEMERAL_RE.search(text))
+
 logger = logging.getLogger(__name__)
 
 _conn_local = threading.local()
@@ -451,6 +473,13 @@ async def hot_cache_put(query: str, entry: dict, purpose: str = "chat") -> None:
         _hot_cache[key] = entry
 
 
+async def hot_cache_delete(query: str, purpose: str = "chat") -> None:
+    """Evict a hot entry (e.g. a gate-rejected semantic hit) so the same query
+    cannot be re-served un-gated from the hot cache."""
+    async with _hot_cache_lock:
+        _hot_cache.pop(f"{purpose}:{query}", None)
+
+
 async def cache_lookup(match_query: str, purpose: str = "chat") -> dict | None:
     """Unified cache lookup: hot cache → FTS5 → LLM smart match → fallback full scan.
     Uses LLM-based semantic matching instead of RapidFuzz string distance."""
@@ -462,10 +491,14 @@ async def cache_lookup(match_query: str, purpose: str = "chat") -> dict | None:
             "cache verdict=HIT source=hot age_days=%s query=%r",
             age_days(hot.get("created_at")), match_query[:80],
         )
+        hot["source"] = "hot"
         return hot
 
     match = await smart_cache_lookup(match_query, purpose)
     if match:
+        # source tag lets callers gate only SEMANTIC hits (hot/G0 are exact
+        # matches and skip the relevance gatekeeper).
+        match["source"] = "semantic"
         await hot_cache_put(match_query, match, purpose)
         return match
 
