@@ -103,17 +103,14 @@ async def handle_chat_completion(body: dict) -> dict:
 
     if match:
         if tools:
-            # Few-shot example injection for tool-bearing (agent) traffic —
-            # mirrors code_proxy.WRITER_PROMPT. Avoids the chat relevance-check
-            # prompt interfering with tool loops (A/B verified 2026-08-21:
-            # example-style = -31% prompt tokens, tool calls work, no quality
-            # regression vs context-style).
-            cheap_messages = [
-                {"role": "user", "content": match["query"]},
-                {"role": "assistant", "content": match["answer"]},
-            ] + list(messages)
+            # Cache hit with tools: NO injection. Measured 2026-08-21: the
+            # example-pair format is ignored by the cheap model for knowledge
+            # (0/6 fact adoption vs context-style 6/6) and suppresses tool
+            # verification (9/9 tool calls without injection vs ~0 with).
+            # The hit's value here is cheap routing; the agent loop's tools
+            # provide verification.
             result = await call_cheap_full(
-                cheap_messages, temperature, max_tokens, tools=tools
+                list(messages), temperature, max_tokens, tools=tools
             )
         else:
             context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
@@ -260,13 +257,11 @@ async def stream_chat_completion(body: dict):
 
     if match:
         # Cache hit — buffer cheap response, verify IRRELEVANT, then stream.
-        # Tools → few-shot example injection (mirrors code_proxy.WRITER_PROMPT);
-        # plain chat keeps the context-style relevance check.
+        # Tools → no injection (example-pair ignored by cheap model + suppresses
+        # tool verification; measured 2026-08-21). Plain chat keeps the
+        # context-style relevance check (verified: adopts cached facts 6/6).
         if tools:
-            cheap_messages = [
-                {"role": "user", "content": match["query"]},
-                {"role": "assistant", "content": match["answer"]},
-            ] + list(messages)
+            cheap_messages = list(messages)
         else:
             context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
                 expert_answer=match["answer"],
