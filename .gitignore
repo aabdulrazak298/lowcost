@@ -29,3 +29,4 @@ server.log
 404_debug.log
 *.bak
 *.bak-*
+backups/
