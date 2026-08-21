@@ -102,18 +102,26 @@ async def handle_chat_completion(body: dict) -> dict:
     rationale = "no cache match"
 
     if match:
-        context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
-            expert_answer=match["answer"],
-            user_query=user_query,
-        )
-        cheap_messages = list(messages)
-        cheap_messages.append({"role": "user", "content": context_prompt})
-
         if tools:
+            # Few-shot example injection for tool-bearing (agent) traffic —
+            # mirrors code_proxy.WRITER_PROMPT. Avoids the chat relevance-check
+            # prompt interfering with tool loops (A/B verified 2026-08-21:
+            # example-style = -31% prompt tokens, tool calls work, no quality
+            # regression vs context-style).
+            cheap_messages = [
+                {"role": "user", "content": match["query"]},
+                {"role": "assistant", "content": match["answer"]},
+            ] + list(messages)
             result = await call_cheap_full(
                 cheap_messages, temperature, max_tokens, tools=tools
             )
         else:
+            context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
+                expert_answer=match["answer"],
+                user_query=user_query,
+            )
+            cheap_messages = list(messages)
+            cheap_messages.append({"role": "user", "content": context_prompt})
             text = await call_cheap(cheap_messages, temperature, max_tokens)
             # Report the model that ACTUALLY answered — fallback may have fired.
             used = get_last_usage().get("model") or get_cheap_model()
@@ -207,6 +215,7 @@ async def handle_chat_completion(body: dict) -> dict:
         "selected_model": model_used,
         "rationale": rationale,
         "decision_source": decision_source,
+        "cache_id": match.get("id") if (match and decision_source == "cache-hit") else None,
     }
     logger.info("chat routing: source=%s model=%s rationale=%s",
                 decision_source, model_used, rationale)
@@ -250,13 +259,21 @@ async def stream_chat_completion(body: dict):
     decision_source = "cache-miss"
 
     if match:
-        # Cache hit — buffer cheap response, verify IRRELEVANT, then stream
-        context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
-            expert_answer=match["answer"],
-            user_query=user_query,
-        )
-        cheap_messages = list(messages)
-        cheap_messages.append({"role": "user", "content": context_prompt})
+        # Cache hit — buffer cheap response, verify IRRELEVANT, then stream.
+        # Tools → few-shot example injection (mirrors code_proxy.WRITER_PROMPT);
+        # plain chat keeps the context-style relevance check.
+        if tools:
+            cheap_messages = [
+                {"role": "user", "content": match["query"]},
+                {"role": "assistant", "content": match["answer"]},
+            ] + list(messages)
+        else:
+            context_prompt = CHEAP_MODEL_CONTEXT_PROMPT.format(
+                expert_answer=match["answer"],
+                user_query=user_query,
+            )
+            cheap_messages = list(messages)
+            cheap_messages.append({"role": "user", "content": context_prompt})
 
         result = await call_cheap_full(
             cheap_messages, temperature, max_tokens, tools=tools
