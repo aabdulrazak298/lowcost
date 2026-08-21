@@ -4,6 +4,8 @@ Maintains two independent stat buckets: chat (`_stats`) and code (`_code_stats`)
 The code path (judge/router) records with `purpose="code"` so its metrics are
 tracked separately from general chat.
 """
+import json
+import os
 import threading
 from collections import deque
 from datetime import datetime, timezone
@@ -11,6 +13,23 @@ from datetime import datetime, timezone
 
 _lock = threading.Lock()
 _started_at = datetime.now(timezone.utc).isoformat()
+
+# Optional per-request usage log (JSONL). Set LOWCOSTLLM_USAGE_LOG=/path/to/file
+# to enable. Each LLM-serving request appends one line:
+#   {ts, purpose, hit, model, prompt_tokens, completion_tokens, tool_calls}
+# Lets you compute expensive-vs-cheap token ratios per purpose. Append-only;
+# disabled by default so production is unaffected.
+def _log_usage_line(entry: dict) -> None:
+    log_path = os.getenv("LOWCOSTLLM_USAGE_LOG", "")
+    if not log_path:
+        return
+    entry["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
 
 _STATS_KEYS = (
     "total_requests", "cache_hits", "cache_misses", "irrelevant_escalations",
@@ -88,6 +107,14 @@ def record_request(
         target["total_tokens"] += prompt_tokens + completion_tokens
         target["models"][model] = target["models"].get(model, 0) + 1
         _save_count += 1
+        _log_usage_line({
+            "purpose": purpose,
+            "hit": hit,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "tool_calls": tool_calls,
+        })
 
     if _save_count % 10 == 0:
         _flush_db()

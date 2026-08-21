@@ -26,6 +26,25 @@ CHEAP_MODEL = os.getenv("CHEAP_MODEL", "qwen/qwen3.7-flash")
 CHEAP_FALLBACK_MODEL = os.getenv("CHEAP_FALLBACK_MODEL", "deepseek/deepseek-v4-flash")
 CHEAP_FALLBACK_RETRIES = int(os.getenv("CHEAP_FALLBACK_RETRIES", "2"))
 
+# Wall-clock deadline per LLM call (agent run / completion). Bounds hangs:
+# an upstream that trickles bytes never trips the read idle timeout, so
+# without a deadline a stuck provider blocks the request indefinitely and
+# the fallback chain never fires (nothing raises). On deadline the cheap
+# path skips remaining retries and goes straight to the fallback model.
+LLM_DEADLINE_SECONDS = float(os.getenv("LLM_DEADLINE_SECONDS", "120"))
+
+# Webhook processing backstop: if a request exceeds this, the SSE stream
+# ends with a clean error instead of hitting FlaskChat's own read timeout.
+# 540s = just under gunicorn's 600s worker timeout; FlaskChat's own is 1200s.
+WEBHOOK_DEADLINE_SECONDS = float(os.getenv("WEBHOOK_DEADLINE_SECONDS", "540"))
+
+# Provider circuit breaker: after this many primary-cheap failures (stuck
+# deadline, 5xx) within the cooldown window, the provider is skipped and
+# requests fail over to the fallback model immediately. Cheap providers
+# (engy/Bittensor) are expected to fail — fail fast, don't burn deadlines.
+PROVIDER_COOLDOWN_SECONDS = float(os.getenv("PROVIDER_COOLDOWN_SECONDS", "300"))
+PROVIDER_FAIL_THRESHOLD = int(os.getenv("PROVIDER_FAIL_THRESHOLD", "2"))
+
 # Expensive model — DeepSeek V4 Pro direct API (native tool calling)
 EXPENSIVE_API_KEY = os.getenv("EXPENSIVE_API_KEY", "")
 EXPENSIVE_BASE_URL = os.getenv("EXPENSIVE_BASE_URL", "https://api.deepseek.com/v1")
@@ -163,14 +182,30 @@ AVAILABLE_MODELS = {
     "qwen3.8-27b-engy": ("qwen3.8-27b", "Engy"),
 }
 
-# Output pricing per 1M tokens (keyed by model key)
-MODEL_PRICING: dict[str, float] = {
-    "qwen": 0.13, "qwen36": 0.26, "qwen35f": 0.26, "qwen35b": 0.80,
-    "qwen-plus": 1.28, "flash": 0.28, "flash-ds": 0.28, "pro": 0.87,
-    "m3": 2.40, "gemini": 2.50, "gemini-lite": 1.50,
-    "llama": 0.85, "luna": 6.00, "ling": 0.021, "sonnet": 15.00, "nemotron": 2.20, "solar": 0.12,
-    "flash-engy": 0.09,
-    "qwen3.8-27b-engy": 0.32,
+# Pricing per 1M tokens as (input, output) tuples — USD.
+# OpenRouter values verified against the live catalog 2026-08-20;
+# Engy values from engy-verified-inference reference;
+# direct DeepSeek (flash-ds/pro) from deepseek.ai/pricing.
+MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "qwen":       (0.0300, 0.1300),   # qwen/qwen3.7-flash
+    "qwen36":     (0.1875, 1.1250),   # qwen/qwen3.6-flash
+    "qwen35f":    (0.0650, 0.2600),   # qwen/qwen3.5-flash-02-23
+    "qwen35b":    (0.1400, 1.0000),   # qwen/qwen3.6-35b-a3b
+    "qwen-plus":  (0.3200, 1.2800),   # qwen/qwen3.7-plus
+    "flash":      (0.0826, 0.1652),   # deepseek/deepseek-v4-flash (OpenRouter)
+    "flash-ds":   (0.1400, 0.2800),   # deepseek-v4-flash (direct)
+    "pro":        (0.4350, 0.8700),   # deepseek-v4-pro (direct)
+    "m3":         (0.3000, 1.2000),   # minimax/minimax-m3
+    "gemini":     (0.3000, 2.5000),   # google/gemini-2.5-flash
+    "gemini-lite":(0.2500, 1.5000),   # google/gemini-3.1-flash-lite
+    "llama":      (0.2000, 0.8000),   # meta-llama/llama-4-maverick
+    "luna":       (0.2000, 1.2000),   # openai/gpt-5.6-luna
+    "ling":       (0.0210, 0.0630),   # inclusionai/ling-3.0-flash
+    "sonnet":     (3.0000, 15.0000),  # anthropic/claude-sonnet-4
+    "nemotron":   (0.6000, 3.6000),   # nvidia/nemotron-3-ultra-550b-a55b
+    "solar":      (0.0300, 0.1200),   # upstage/solar-pro4
+    "flash-engy": (0.0450, 0.0900),   # deepseek-v4-flash-0731 (Engy)
+    "qwen3.8-27b-engy": (0.0450, 0.3200),  # qwen3.8-27b (Engy)
 }
 
 
@@ -195,17 +230,30 @@ def estimate_cost(model_id: str, output_chars: int) -> float:
     """Estimate cost based on model output pricing and char count (3.5 chars ≈ 1 token)."""
     key = _resolve_key(model_id)
     if key:
-        price = MODEL_PRICING.get(key, 0.28)
+        _, out_price = MODEL_PRICING.get(key, (0.14, 0.28))
         tokens = output_chars / 3.5
-        return (tokens / 1_000_000) * price
+        return (tokens / 1_000_000) * out_price
     return 0.0
 
 
-def build_calling_card(model_used: str, usage: dict | None = None) -> str:
+# Show ' · c#<id>' in the calling card on cache hits so a wrong cached answer
+# can be traced to its row and deleted (DELETE /admin/cache/{id}).
+# DEFAULT OFF: at cache scale the footer becomes noise — use the FlaskChat
+# Cache Manager page (/admin/cache) instead. Opt-in only.
+CACHE_ID_TRACE = os.getenv("CACHE_ID_TRACE", "0") == "1"
+
+
+def build_calling_card(
+    model_used: str, usage: dict | None = None, cache_id: int | None = None
+) -> str:
     """Build the '🤖 <short-key> · $<cost>' footer shown after an answer.
 
     Single source of truth for the Telegram + web calling card, so both
     platforms show the identical model label and real token cost.
+
+    When cache_id is given (and CACHE_ID_TRACE is on), appends ' · c#<id>'
+    so a wrong cached answer can be traced back to its row and deleted via
+    DELETE /admin/cache/{id}.
     """
     usage = usage or {}
 
@@ -219,13 +267,14 @@ def build_calling_card(model_used: str, usage: dict | None = None) -> str:
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
     if prompt_tokens or completion_tokens:
-        price_per_m = MODEL_PRICING.get(key, 0.28) if key else 0.28
+        in_price, out_price = MODEL_PRICING.get(key, (0.14, 0.28)) if key else (0.14, 0.28)
         total_tokens = prompt_tokens + completion_tokens
-        cost = (total_tokens / 1_000_000) * price_per_m
+        cost = (prompt_tokens / 1_000_000) * in_price + (completion_tokens / 1_000_000) * out_price
         cost_str = f" · ${cost:.6f} · {total_tokens} tok"
     else:
         cost_str = ""
-    return f"\n\n---\n🤖 {short_name}{cost_str}"
+    trace = f" · c#{cache_id}" if (CACHE_ID_TRACE and cache_id is not None) else ""
+    return f"\n\n---\n🤖 {short_name}{cost_str}{trace}"
 
 
 # Telegram bot

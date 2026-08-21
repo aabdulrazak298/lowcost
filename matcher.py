@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,6 +27,7 @@ logger = logging.getLogger(__name__)
 MODEL_NAME = "all-MiniLM-L6-v2"
 DIM = 384
 SEM_THRESHOLD = float(os.environ.get("LCLLM_SEM_THRESHOLD", "0.45"))
+CODE_LEXICON_FAST_PATH = os.environ.get("CODE_LEXICON_FAST_PATH", "1") == "1"
 
 _model: Any = None
 _model_failed: bool = False
@@ -136,6 +140,123 @@ def _score_and_pick(
 # ── Main lookup ──────────────────────────────────────────────
 
 
+# ── Code lexicon fast path ────────────────────────────────────────
+#
+# For purpose="code" lookups, run a rare-token lexicon pre-check BEFORE the
+# embedding pipeline. Exact-token rewrites ("change the csv export to use
+# semicolon") share identifiers that appear in exactly ONE cached question
+# (df==1: csv, yaml, sha256...) — a strong lexical anchor that makes the
+# embedding step unnecessary. If no rare-token anchor exists, fall through to
+# the semantic path (paraphrased rewrites need recall, not precision — the
+# code router's p_solve judge is the final precision gate anyway).
+#
+# Benchmark: scripts/test_code_matchers.py + scripts/test_judge_veto.py
+# (2026-08-20) — rare-token gate recalls exact rewrites, misses paraphrases
+# (semantic catches those), and the judge vetoes same-family-different-task.
+
+_CODE_STOPWORDS = {
+    "the", "a", "an", "to", "of", "in", "for", "on", "with", "write", "implement",
+    "create", "make", "use", "add", "set", "up", "and", "or", "not", "my", "i",
+    "we", "you", "can", "could", "would", "should", "this", "that", "is", "are",
+    "was", "were", "be", "been", "it", "its", "as", "at", "by", "from", "into",
+    "over", "under", "again", "further", "then", "once", "here", "there", "all",
+    "any", "both", "each", "few", "more", "most", "other", "some", "such", "only",
+    "own", "same", "so", "than", "too", "very", "code", "function", "python",
+    # generic words that pollute df==1 on small corpora (rare only at scale:
+    # real identifiers like csv/yaml/sha256/binary stay meaningful)
+    "file", "list", "value", "data", "number", "format", "output", "input",
+    "way", "get", "put", "need", "want", "like", "just", "also", "new", "old",
+}
+
+
+def _code_tokenize(text: str) -> list[str]:
+    """Code-aware tokenizer: camelCase split, snake_case split, keep digits."""
+    text = text.lower()
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return [t for t in text.split() if t and t not in _CODE_STOPWORDS and len(t) > 1]
+
+
+def _build_code_lexicon(rows: list[dict]) -> dict:
+    """Build the rare-token index from cached code questions.
+
+    rows: list of dicts with at least id + query (answer/model_used/etc kept
+    for the returned candidate). Returns index dict:
+      df: Counter token -> doc frequency
+      rare: {row_id: set(rare tokens)}  (df == 1 = strong identifier)
+      rows: {row_id: row}
+    """
+    toks = {r["id"]: set(_code_tokenize(r.get("query", ""))) for r in rows}
+    df = Counter()
+    for ts in toks.values():
+        df.update(ts)
+    rare = {rid: {t for t in ts if df[t] == 1} for rid, ts in toks.items()}
+    return {
+        "df": df,
+        "rare": rare,
+        "rows": {r["id"]: r for r in rows},
+    }
+
+
+_code_index: dict | None = None
+_code_index_sig: tuple | None = None
+_code_index_checked: float = 0.0
+_CODE_INDEX_TTL = 30.0  # seconds between DB signature checks
+
+
+def _refresh_code_index() -> dict:
+    """Load code-purpose cache rows and rebuild the lexicon index on change.
+
+    Signature check (COUNT + MAX id) is a cheap read; full rebuild only when
+    the code cache actually changed. TTL-bounded to avoid a SELECT per call.
+    """
+    global _code_index, _code_index_sig, _code_index_checked
+    now = time.time()
+    if _code_index is not None and (now - _code_index_checked) < _CODE_INDEX_TTL:
+        return _code_index
+    _code_index_checked = now
+    try:
+        from db import get_conn
+        conn = get_conn()
+        sig_row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM qa_cache WHERE purpose = 'code'"
+        ).fetchone()
+        sig = (sig_row[0], sig_row[1])
+        if sig == _code_index_sig:
+            return _code_index
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, query, answer, model_used, hit_count, created_at "
+            "FROM qa_cache WHERE purpose = 'code'"
+        ).fetchall()]
+        _code_index = _build_code_lexicon(rows)
+        _code_index_sig = sig
+    except Exception:
+        logger.exception("Code lexicon index refresh failed — using stale index")
+    return _code_index or {"df": Counter(), "rare": {}, "rows": {}}
+
+
+def _code_lexicon_lookup(match_query: str, index: dict | None = None) -> dict | None:
+    """Rare-token lexicon pre-check. Returns best code-cache row (≥1 shared
+    rare token) or None (fall through to semantic path).
+
+    index: optional prebuilt index (testing); defaults to the live DB index.
+    """
+    if index is None:
+        index = _refresh_code_index()
+    qset = set(_code_tokenize(match_query))
+    best_id, best_score = None, 0
+    for rid, rare in index["rare"].items():
+        shared = len(qset & rare)
+        if shared > best_score:
+            best_score, best_id = shared, rid
+    if best_id is None or best_score < 1:
+        return None
+    row = dict(index["rows"][best_id])
+    row["rank"] = 0.0  # shape parity with search_candidates rows
+    row["_lexicon_score"] = best_score
+    return row
+
+
 async def smart_cache_lookup(match_query: str, purpose: str = "chat") -> dict | None:
     """Semantic cache lookup using local transformer embeddings.
 
@@ -152,6 +273,17 @@ async def smart_cache_lookup(match_query: str, purpose: str = "chat") -> dict | 
     admit an unrelated candidate: the 2026-08-14 bug was min-maxing the
     cosine itself (0.077 → 1.0 → false hit).
     """
+    # Code fast path: rare-token lexicon pre-check (skips embedding entirely).
+    if purpose == "code" and CODE_LEXICON_FAST_PATH:
+        fast = _code_lexicon_lookup(match_query)
+        if fast:
+            score = fast.pop("_lexicon_score", 0)
+            logger.info(
+                "cache verdict=HIT source=lexicon-fast score=%s query=%r matched=%r",
+                score, match_query[:80], fast.get("query", "")[:80],
+            )
+            return fast
+
     # FTS5 pre-filter (lexical) — limits how many candidates we embed
     candidates = search_candidates(match_query, limit=20, purpose=purpose)
     if not candidates:

@@ -49,6 +49,7 @@ async def _classifier_route(
                     "selected_model": model_used,
                     "rationale": "session-affinity cheap",
                     "decision_source": "session-affinity",
+                    "cache_id": match["id"],
                 }
         result = await _answer_expensive(messages, tools)
         model_used = result["model"]
@@ -107,6 +108,7 @@ async def _classifier_route(
                 "selected_model": model_used,
                 "rationale": rationale,
                 "decision_source": "llm-classifier",
+                "cache_id": match["id"],
             }
 
         result = await _answer_expensive(messages, tools)

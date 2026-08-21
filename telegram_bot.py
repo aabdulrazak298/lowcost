@@ -12,7 +12,7 @@ from telegram import Update, MessageEntity
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegramify_markdown import convert, richify
 
-from processor import process_query
+from processor import process_query, get_last_cache_id
 from llm import set_delivery_context, clear_delivery_context
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS, AVAILABLE_MODELS,
@@ -445,7 +445,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Build calling card with short model name and REAL cost (shared helper)
         from config import build_calling_card
 
-        footer = build_calling_card(model_used, usage)
+        footer = build_calling_card(model_used, usage, cache_id=get_last_cache_id())
         full_response = response + footer
 
         # Send — voice bubble + hidden transcript if voice mode is ON

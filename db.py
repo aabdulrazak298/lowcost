@@ -356,6 +356,36 @@ def delete_cache_entry(cache_id: int) -> int:
     return cur.rowcount
 
 
+def list_cache_entries(
+    limit: int = 50, purpose: str | None = None, search: str | None = None
+) -> list[dict]:
+    """List recent cache rows for the admin view.
+
+    Optional filters: purpose ('chat'|'code'), search (substring on query).
+    Ordered newest first. Used by GET /admin/cache so bad entries can be
+    identified by id and deleted via DELETE /admin/cache/{id}.
+    """
+    conn = get_conn()
+    sql = (
+        "SELECT id, query, answer, model_used, purpose, hit_count, "
+        "created_at, last_accessed FROM qa_cache"
+    )
+    conds: list[str] = []
+    params: list = []
+    if purpose in ("chat", "code"):
+        conds.append("purpose = ?")
+        params.append(purpose)
+    if search:
+        conds.append("query LIKE ?")
+        params.append(f"%{search}%")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 def increment_hit_count(cache_id: int) -> None:
     conn = get_conn()
     conn.execute(

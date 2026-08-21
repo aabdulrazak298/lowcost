@@ -364,6 +364,8 @@ async def chat_completions(request: Request, _auth=Depends(_auth_dependency)):
             headers["x-model-router-selected-model"] = _header_safe(str(routing_meta["selected_model"]))
         if routing_meta.get("rationale"):
             headers["x-model-router-rationale"] = _header_safe(str(routing_meta["rationale"]))
+        if routing_meta.get("cache_id"):
+            headers["x-cache-id"] = str(routing_meta["cache_id"])
         return JSONResponse(result, headers=headers)
 
     except Exception as e:
@@ -420,6 +422,8 @@ async def code_completions(request: Request, _auth=Depends(_auth_dependency)):
             headers["x-model-router-selected-model"] = _header_safe(str(routing_meta["selected_model"]))
         if routing_meta.get("rationale"):
             headers["x-model-router-rationale"] = _header_safe(str(routing_meta["rationale"]))
+        if routing_meta.get("cache_id"):
+            headers["x-cache-id"] = str(routing_meta["cache_id"])
         return JSONResponse(result, headers=headers)
 
     except Exception as e:
@@ -488,6 +492,37 @@ async def admin_dashboard(request: Request, _auth=Depends(_auth_dependency)):
         "usage": get_stats(),
         "code": get_code_stats(),
     }
+
+
+@app.get("/admin/cache")
+async def admin_cache_list(
+    request: Request,
+    purpose: str | None = None,
+    limit: int = 50,
+    q: str | None = None,
+    _auth=Depends(_auth_dependency),
+):
+    """List recent cache rows (id, query, answer, model, hits) for tracing/deleting.
+
+    Usage: GET /admin/cache?limit=30&purpose=chat&q=leaktester
+    Localhost requests skip auth (same as /admin).
+    """
+    from db import list_cache_entries
+
+    capped = min(max(int(limit), 1), 200)
+    entries = list_cache_entries(limit=capped, purpose=purpose, search=q)
+    return {"count": len(entries), "entries": entries}
+
+
+@app.delete("/admin/cache/{cache_id}")
+async def admin_cache_delete(cache_id: int, _auth=Depends(_auth_dependency)):
+    """Delete a cache row by id (wrong/poisoned answer). Returns 404 if gone."""
+    from db import delete_cache_entry
+
+    deleted = delete_cache_entry(cache_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Cache entry {cache_id} not found")
+    return {"deleted": deleted, "cache_id": cache_id}
 
 
 # ── Catch-all (debug 404s) ──────────────────────────────────────

@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+import time
 
 import httpx
 from openai import AsyncOpenAI
@@ -26,6 +27,9 @@ from config import (
     CHEAP_BASE_URL,
     CHEAP_FALLBACK_MODEL,
     CHEAP_FALLBACK_RETRIES,
+    LLM_DEADLINE_SECONDS,
+    PROVIDER_COOLDOWN_SECONDS,
+    PROVIDER_FAIL_THRESHOLD,
     EXPENSIVE_API_KEY,
     EXPENSIVE_BASE_URL,
     ENGY_API_KEY,
@@ -495,9 +499,42 @@ async def search_cache(query: str) -> str:
 # ── Client factories ──────────────────────────────────────────────
 
 
+def _wrap_error_detection(client: AsyncOpenAI) -> AsyncOpenAI:
+    """Raise when OpenRouter signals a mid-stream provider failure.
+
+    OpenRouter returns HTTP 200 with finish_reason="error" and PARTIAL content
+    when the upstream provider (e.g. Alibaba serving qwen) fails mid-generation.
+    The OpenAI SDK accepts the truncated text as a complete answer — observed
+    2026-08-20: long qwen3.7-flash answers delivered cut mid-sentence with the
+    footer intact. Raising here sends the failure into the existing retry /
+    fallback chain (call_cheap attempts -> cheap fallback -> processor
+    transient-failure path) instead of delivering a partial answer.
+
+    Streaming responses are left untouched (their error path is chunk-based).
+    """
+    orig_create = client.chat.completions.create
+
+    async def wrapped(*args, **kwargs):
+        if kwargs.get("stream"):
+            return await orig_create(*args, **kwargs)
+        resp = await orig_create(*args, **kwargs)
+        if getattr(resp, "choices", None):
+            fr = getattr(resp.choices[0], "finish_reason", None)
+            if fr == "error":
+                partial = getattr(resp.choices[0].message, "content", "") or ""
+                raise RuntimeError(
+                    f"Provider returned finish_reason='error' (mid-stream "
+                    f"failure) — partial response discarded: {partial[:120]!r}"
+                )
+        return resp
+
+    client.chat.completions.create = wrapped  # type: ignore[method-assign]
+    return client
+
+
 def _build_cheap_client() -> AsyncOpenAI:
     """OpenRouter client for cheap model."""
-    return AsyncOpenAI(
+    return _wrap_error_detection(AsyncOpenAI(
         base_url=CHEAP_BASE_URL,
         api_key=CHEAP_API_KEY,
         max_retries=1, timeout=httpx.Timeout(connect=5.0, read=180.0, write=120.0, pool=5.0),
@@ -505,25 +542,30 @@ def _build_cheap_client() -> AsyncOpenAI:
             "HTTP-Referer": "http://localhost:8800",
             "X-Title": "LowCostLLM",
         },
-    )
+    ))
 
 
 def _build_expensive_client() -> AsyncOpenAI:
     """Direct API client for expensive model (with OpenRouter fallback)."""
-    return AsyncOpenAI(
+    return _wrap_error_detection(AsyncOpenAI(
         base_url=EXPENSIVE_BASE_URL,
         api_key=EXPENSIVE_API_KEY,
         max_retries=1, timeout=httpx.Timeout(connect=5.0, read=180.0, write=120.0, pool=5.0),
-    )
+    ))
 
 
 def _build_engy_client() -> AsyncOpenAI:
-    """Engy client — decentralized verified inference (Bittensor SN53)."""
-    return AsyncOpenAI(
+    """Engy client — decentralized verified inference (Bittensor SN53).
+
+    max_retries=0: engy is a cheap provider, failures are EXPECTED. The SDK's
+    auto-retry doubles every slow 503 wait (~30s each when engy is down);
+    call_cheap's own retry/fallback loop already covers retries.
+    """
+    return _wrap_error_detection(AsyncOpenAI(
         base_url=ENGY_BASE_URL,
         api_key=ENGY_API_KEY,
-        max_retries=1, timeout=httpx.Timeout(connect=5.0, read=180.0, write=120.0, pool=5.0),
-    )
+        max_retries=0, timeout=httpx.Timeout(connect=5.0, read=180.0, write=120.0, pool=5.0),
+    ))
 
 
 def _client_for_model(model_id: str) -> AsyncOpenAI:
@@ -556,6 +598,41 @@ def _reasoning_settings(model_id: str, force_reasoning: bool = False) -> ModelSe
     return None
 
 
+# ── Provider circuit breaker ────────────────────────────────────────
+#
+# Cheap providers (engy/Bittensor) are expected to fail. Without a breaker,
+# every request burns the full deadline on a known-dead upstream before
+# failing over. After PROVIDER_FAIL_THRESHOLD failures of the PRIMARY cheap
+# model within PROVIDER_COOLDOWN_SECONDS, the provider is skipped entirely
+# and call_cheap goes straight to the fallback model. Circuit auto-closes
+# after the cooldown window (next request retries the provider).
+
+_PROVIDER_FAILURES: dict[str, list[float]] = {}
+
+
+class CircuitOpenError(Exception):
+    """Raised when a provider's circuit is open — skip it, use fallback."""
+
+
+def _record_provider_failure(model_id: str) -> None:
+    now = time.time()
+    fails = [t for t in _PROVIDER_FAILURES.get(model_id, []) if now - t < PROVIDER_COOLDOWN_SECONDS]
+    fails.append(now)
+    _PROVIDER_FAILURES[model_id] = fails
+    if len(fails) >= PROVIDER_FAIL_THRESHOLD:
+        logger.warning(
+            "Provider %s circuit OPEN for %.0fs (%d failures in window)",
+            model_id, PROVIDER_COOLDOWN_SECONDS, len(fails),
+        )
+
+
+def _provider_circuit_open(model_id: str) -> bool:
+    now = time.time()
+    fails = [t for t in _PROVIDER_FAILURES.get(model_id, []) if now - t < PROVIDER_COOLDOWN_SECONDS]
+    _PROVIDER_FAILURES[model_id] = fails
+    return len(fails) >= PROVIDER_FAIL_THRESHOLD
+
+
 # ── Agent wrappers ────────────────────────────────────────────────
 
 
@@ -569,6 +646,8 @@ async def _run_cheap_agent(
 ) -> str:
     """Run the cheap Agent for ONE specific model. Raises on failure — the
     caller (call_cheap) owns retry and fallback policy."""
+    if _provider_circuit_open(model_id):
+        raise CircuitOpenError(f"circuit open for {model_id}")
     client = _client_for_model(model_id)
 
     # Build the SDK model
@@ -618,8 +697,13 @@ async def _run_cheap_agent(
         model=sdk_model,
     )
     ms = _reasoning_settings(model_id, force_reasoning=reasoning)
-    if ms is not None:
-        agent_kwargs["model_settings"] = ms
+    if ms is None:
+        ms = ModelSettings()
+    # The agent SDK sends max_tokens ONLY from ModelSettings; without this the
+    # request goes out with max_tokens omitted and the provider's default
+    # applies (OpenRouter defaults vary by model). Enforce the caller's cap.
+    ms.max_tokens = max_tokens
+    agent_kwargs["model_settings"] = ms
     agent = Agent(**agent_kwargs)
 
     # Convert messages to input string
@@ -627,7 +711,14 @@ async def _run_cheap_agent(
         f"{m['role']}: {m['content']}" for m in user_messages[-5:]
     )
 
-    result = await Runner.run(agent, input=input_text, max_turns=30)
+    # Wall-clock deadline: a stuck upstream that trickles bytes never trips
+    # the read idle timeout — without this the whole request can hang forever.
+    # Deadline exceeded raises asyncio.TimeoutError, which call_cheap treats
+    # as "stuck" → straight to the fallback model (no pointless retries).
+    result = await asyncio.wait_for(
+        Runner.run(agent, input=input_text, max_turns=30),
+        timeout=LLM_DEADLINE_SECONDS,
+    )
 
     # Track usage (SDK 0.20.0: usage on raw ModelResponses, not RunResult)
     if result:
@@ -663,8 +754,25 @@ async def call_cheap(
     for i in range(attempts):
         try:
             return await _run_cheap_agent(primary, messages, temperature, max_tokens, tools, reasoning)
+        except CircuitOpenError as e:
+            # Provider circuit open — no point trying it again right now.
+            last_err = e
+            logger.warning("Cheap model %s circuit OPEN — going straight to fallback", primary)
+            break
+        except asyncio.TimeoutError as e:
+            # Wall-clock deadline exceeded = upstream STUCK, not a transient
+            # blip. Retrying a dead upstream just burns minutes — go straight
+            # to the fallback model.
+            last_err = e
+            _record_provider_failure(primary)
+            logger.warning(
+                "Cheap model %s STUCK (deadline %.0fs) — skipping retries, falling back",
+                primary, LLM_DEADLINE_SECONDS,
+            )
+            break
         except Exception as e:
             last_err = e
+            _record_provider_failure(primary)
             logger.warning("Cheap model %s attempt %d/%d failed: %s", primary, i + 1, attempts, e)
             if i < attempts - 1:
                 await asyncio.sleep(0.5 * (i + 1))
@@ -704,16 +812,36 @@ async def call_cheap_raw(
     for i in range(attempts):
         try:
             client = _client_for_model(primary)
-            resp = await client.chat.completions.create(
-                model=primary,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **client_kwargs,
+            if _provider_circuit_open(primary):
+                raise CircuitOpenError(f"circuit open for {primary}")
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=primary,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **client_kwargs,
+                ),
+                timeout=LLM_DEADLINE_SECONDS,
             )
             return resp, primary
+        except CircuitOpenError as e:
+            # Circuit open — skip remaining primary retries, go to fallback.
+            last_err = e
+            logger.warning("Cheap raw %s circuit OPEN — going straight to fallback", primary)
+            break
+        except asyncio.TimeoutError as e:
+            # Stuck upstream — skip remaining primary retries, go to fallback.
+            last_err = e
+            _record_provider_failure(primary)
+            logger.warning(
+                "Cheap raw %s STUCK (deadline %.0fs) — skipping retries, falling back",
+                primary, LLM_DEADLINE_SECONDS,
+            )
+            break
         except Exception as e:
             last_err = e
+            _record_provider_failure(primary)
             logger.warning("Cheap raw %s attempt %d/%d failed: %s", primary, i + 1, attempts, e)
             if i < attempts - 1:
                 await asyncio.sleep(0.5 * (i + 1))
@@ -726,12 +854,15 @@ async def call_cheap_raw(
         )
         try:
             client = _client_for_model(fallback)
-            resp = await client.chat.completions.create(
-                model=fallback,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **client_kwargs,
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=fallback,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **client_kwargs,
+                ),
+                timeout=LLM_DEADLINE_SECONDS,
             )
             return resp, fallback
         except Exception as e:
@@ -804,15 +935,22 @@ async def _call_expensive_with_client(
         model=sdk_model,
     )
     ms = _reasoning_settings(model_id)
-    if ms is not None:
-        agent_kwargs["model_settings"] = ms
+    if ms is None:
+        ms = ModelSettings()
+    # Same max_tokens wiring as _run_cheap_agent — see comment there.
+    ms.max_tokens = max_tokens
+    agent_kwargs["model_settings"] = ms
     agent = Agent(**agent_kwargs)
 
     input_text = "\n".join(
         f"{m['role']}: {m['content']}" for m in user_messages[-10:]
     )
 
-    result = await Runner.run(agent, input=input_text, max_turns=30)
+    # Wall-clock deadline — same stuck-upstream protection as the cheap agent.
+    result = await asyncio.wait_for(
+        Runner.run(agent, input=input_text, max_turns=30),
+        timeout=LLM_DEADLINE_SECONDS,
+    )
 
     # Track usage (SDK 0.20.0: usage on raw ModelResponses, not RunResult)
     if result:
@@ -847,7 +985,10 @@ async def call_curator_verdict(cached_question: str, cached_answer: str) -> str:
         agent_kwargs["model_settings"] = ms
     agent = Agent(**agent_kwargs)
     try:
-        result = await Runner.run(agent, input=msgs[1]["content"], max_turns=1)
+        result = await asyncio.wait_for(
+            Runner.run(agent, input=msgs[1]["content"], max_turns=1),
+            timeout=LLM_DEADLINE_SECONDS,
+        )
         return result.final_output if result else ""
     except Exception as e:
         logger.warning(f"Curator verdict call failed: {e}")

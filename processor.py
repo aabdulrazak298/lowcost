@@ -16,6 +16,22 @@ from curator import run_curator
 
 logger = logging.getLogger(__name__)
 
+# ── Last cache-hit id tracker (footer trace: ' · c#<id>') ────────
+# Set at every cache-hit return so the calling card can show which row
+# served the answer; cleared on non-hit paths. Same pattern as the usage
+# tracker in llm.py.
+
+_last_cache_id: int | None = None
+
+
+def set_last_cache_id(cid: int | None) -> None:
+    global _last_cache_id
+    _last_cache_id = cid
+
+
+def get_last_cache_id() -> int | None:
+    return _last_cache_id
+
 _TODAY = _dt.datetime.now().strftime("%A, %d %B %Y")
 _DATE_CONTEXT = f"Today's date is {_TODAY}. Use this for any time-sensitive context."
 _CACHE_AWARE_PROMPT = (
@@ -483,6 +499,7 @@ async def process_query(
         if not is_escalate:
             model_used = f"{get_cheap_model()} (agentic-cached)"
             record_request(hit=True, model=model_used)
+            set_last_cache_id(None)
             return answer, model_used, _get_generated_images(), usage
         match = None
     else:
@@ -550,6 +567,7 @@ async def process_query(
                 increment_hit_count(match["id"])
                 model_used = f"{get_cheap_model()} (cached-direct)"
                 record_request(hit=True, model=model_used)
+                set_last_cache_id(match["id"])
                 return match["answer"], model_used, _get_generated_images(), get_last_usage()
 
         usage = get_last_usage()
@@ -568,6 +586,7 @@ async def process_query(
             # Report the model that ACTUALLY answered — fallback may have fired.
             model_used = f"{usage.get('model') or get_cheap_model()} (cached)"
             record_request(hit=True, model=model_used)
+            set_last_cache_id(match["id"])
             return answer, model_used, _get_generated_images(), usage
 
     # --- EXPENSIVE PATH: history replayed as turns, no cache blob ---
@@ -591,6 +610,7 @@ async def process_query(
     if rejected_match is not None:
         await run_curator(rejected_match)
 
+    set_last_cache_id(None)
     return answer, model_used, _get_generated_images(), usage
 
 
@@ -622,6 +642,7 @@ async def process_query_stream(
             usage = get_last_usage()
             model_used = f"{usage.get('model') or get_cheap_model()} (agentic-cached)"
             record_request(hit=True, model=model_used)
+            set_last_cache_id(None)
             if asyncio.iscoroutinefunction(callback):
                 await callback(answer)
             else:
@@ -693,6 +714,7 @@ async def process_query_stream(
                 increment_hit_count(match["id"])
                 model_used = f"{get_cheap_model()} (cached-direct)"
                 record_request(hit=True, model=model_used)
+                set_last_cache_id(match["id"])
                 if asyncio.iscoroutinefunction(callback):
                     await callback(match["answer"])
                 else:
@@ -713,6 +735,7 @@ async def process_query_stream(
             usage = get_last_usage()
             model_used = f"{usage.get('model') or get_cheap_model()} (cached)"
             record_request(hit=True, model=model_used)
+            set_last_cache_id(match["id"])
             if asyncio.iscoroutinefunction(callback):
                 await callback(answer)
             else:
@@ -742,4 +765,5 @@ async def process_query_stream(
     if rejected_match is not None:
         await run_curator(rejected_match)
 
+    set_last_cache_id(None)
     return model_used, _get_generated_images()
