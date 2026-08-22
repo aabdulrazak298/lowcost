@@ -625,6 +625,19 @@ async def process_query(
                 user_query[:80], match["query"][:80],
             )
         if match is None:
+            # RAW tier: exact/strong repeats hit deterministically. The LLM
+            # rewrite below is NOT stable across calls (same input → different
+            # keys at temperature=0), so repeat queries drift and fall to
+            # semantic at reduced cosine. Raw lookup is local, zero API cost,
+            # and only adds recall — the era/freshness gates and the relevance
+            # gatekeeper below still apply.
+            match = await cache_lookup(user_query)
+            if match is not None:
+                logger.info(
+                    "cache verdict=HIT source=raw-tier query=%r matched=%r",
+                    user_query[:80], match.get("query", "")[:80],
+                )
+        if match is None:
             # The rewrite resolves pronouns/implicit refs from history AND
             # anchors dates — deictic follow-ups ("number 3") become
             # self-contained keys here (was: referential bypass).
@@ -784,6 +797,19 @@ async def process_query_stream(
                     age_days(match.get("created_at")),
                     user_query[:80], match["query"][:80],
                 )
+            if match is None:
+                # RAW tier: exact/strong repeats hit deterministically. The LLM
+                # rewrite below is NOT stable across calls (same input → different
+                # keys at temperature=0), so repeat queries drift and fall to
+                # semantic at reduced cosine. Raw lookup is local, zero API cost,
+                # and only adds recall — the era/freshness gates and the relevance
+                # gatekeeper below still apply.
+                match = await cache_lookup(user_query)
+                if match is not None:
+                    logger.info(
+                        "cache verdict=HIT source=raw-tier query=%r matched=%r",
+                        user_query[:80], match.get("query", "")[:80],
+                    )
             if match is None:
                 match_query = await generate_search_query(user_query, turns)
                 match = await cache_lookup(match_query) if match_query else None
