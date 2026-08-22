@@ -270,25 +270,199 @@ def web_search(query: str) -> str:
     )
 
 
-@function_tool
-def web_fetch(url: str) -> str:
-    """Fetch and extract text content from a web page URL."""
+_WEB_FETCH_CHUNK = 100000  # chars per call — whole-site for typical articles
+
+# Free libraries for page compression (Apache 2.0, lazy-imported):
+#   trafilatura — extracts the MAIN article, drops nav/ads/comments/boilerplate
+#   sumy LSA    — deterministic extractive summarization, no API cost
+# nltk punkt_tab data lives in ~/nltk_data (downloaded once, 2026-08-22).
+
+
+def _download_html(url: str) -> str | None:
+    """Download raw HTML. Returns None on failure."""
     try:
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0 LowCostLLM/0.5"},
         )
         with urllib.request.urlopen(req, timeout=15) as r:
-            html = r.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return f"Fetch failed: {e}"
+            return r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
 
-    # Strip scripts, styles, HTML tags
+
+def _strip_html(html: str) -> str:
+    """Minimal tag-strip fallback (no boilerplate removal)."""
     text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:8000]
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _fetch_page_text(url: str) -> str | None:
+    """Download a page and return its plain text (main-article preferred).
+
+    Uses trafilatura for boilerplate-free extraction when it returns a
+    usable result, else falls back to raw HTML tag-stripping. Returns None
+    only on download failure.
+    """
+    html = _download_html(url)
+    if html is None:
+        return None
+    try:
+        import trafilatura
+        art = trafilatura.extract(html, include_comments=False, include_tables=False)
+        if art and len(art) > 200:
+            return re.sub(r"\s+", " ", art).strip()
+    except Exception:
+        pass
+    return _strip_html(html)
+
+
+_JUNK_HEADINGS = {
+    "recommended for you", "related", "related articles", "trending", "more from",
+    "advertisement", "advertising", "about the author", "more stories",
+    "you may also like", "editorial policies", "sign up", "subscribe",
+    "latest news", "popular now",
+}
+
+
+def _fetch_page_parts(url: str) -> tuple[list[str], str] | None:
+    """Download a page and return (headings, body_text) via trafilatura
+    markdown output, so listicle titles survive as clean heading lines.
+
+    Falls back to ([]) + plain text when markdown extraction fails.
+    Returns None only on download failure.
+    """
+    html = _download_html(url)
+    if html is None:
+        return None
+    try:
+        import trafilatura
+        md = trafilatura.extract(
+            html, include_comments=False, include_tables=False, output_format="markdown"
+        )
+        if md and len(md) > 200:
+            headings, body_lines = [], []
+            for line in md.splitlines():
+                s = line.strip()
+                if s.startswith("#"):
+                    h = s.lstrip("#").strip()
+                    if h and h.lower() not in _JUNK_HEADINGS:
+                        headings.append(h)
+                elif s:
+                    body_lines.append(s)
+            # dedupe headings, keep order
+            seen, uniq = set(), []
+            for h in headings:
+                if h.lower() not in seen:
+                    seen.add(h.lower())
+                    uniq.append(h)
+            body = re.sub(r"\s+", " ", " ".join(body_lines)).strip()
+            return uniq, body
+    except Exception:
+        pass
+    return [], _strip_html(html)
+
+
+def _sumy_digest(text: str, target_chars: int, sections: int = 6) -> str:
+    """Compress text to ~target_chars via segmented sumy LSA (extractive).
+
+    The document is split into `sections` contiguous sentence groups and LSA
+    runs per group with an equal share of the char budget. This guarantees
+    every part of the page contributes (global LSA over-weighted theme prose
+    and dropped enumeration items — e.g. only 2 of 7 anime arcs survived on a
+    CBR listicle). One local SVD per section, deterministic, zero API cost.
+    """
+    from sumy.parsers.plaintext import PlaintextParser
+    from sumy.nlp.tokenizers import Tokenizer
+    from sumy.summarizers.lsa import LsaSummarizer
+
+    parser = PlaintextParser.from_string(text, Tokenizer("english"))
+    sents = list(parser.document.sentences)
+    if len(sents) <= sections:
+        return " ".join(str(s) for s in sents)[:target_chars]
+
+    per = (len(sents) + sections - 1) // sections
+    budget_per = max(200, target_chars // sections)
+    out, size = [], 0
+    for i in range(0, len(sents), per):
+        group = sents[i:i + per]
+        if not group:
+            continue
+        sub = PlaintextParser.from_string(
+            " ".join(str(s) for s in group), Tokenizer("english")
+        )
+        ranked = list(LsaSummarizer()(sub.document, max(2, budget_per // 100)))
+        for s in ranked:
+            t = str(s)
+            if size + len(t) + 1 > target_chars:
+                break
+            out.append(t)
+            size += len(t) + 1
+    return " ".join(out)
+
+
+@function_tool
+def web_fetch(url: str, start: int = 0) -> str:
+    """Fetch and extract text content from a web page URL.
+
+    Returns the WHOLE page text (up to ~100000 chars) in one call. Very long
+    pages are truncated; if the text ends with a '[Content truncated ...]'
+    marker, call web_fetch again with start=<offset from the marker> to read
+    the next chunk. For articles longer than ~40000 chars, prefer
+    summarize_page — it compresses the full page into a short digest.
+    """
+    text = _fetch_page_text(url)
+    if text is None:
+        return "Fetch failed: the page could not be downloaded."
+    if start >= len(text):
+        return "[End of page content — no more text available.]"
+    chunk = text[start:start + _WEB_FETCH_CHUNK]
+    if start + _WEB_FETCH_CHUNK < len(text):
+        chunk += (
+            f"\n\n[Content truncated — page has more text. "
+            f"Call web_fetch(url, start={start + _WEB_FETCH_CHUNK}) to continue.]"
+        )
+    return chunk
+
+
+@function_tool
+def summarize_page(url: str, max_chars: int = 4000) -> str:
+    """Fetch an ENTIRE web page and return a condensed digest covering the WHOLE
+    page. Use this instead of web_fetch for long articles: it extracts the main
+    article (boilerplate stripped) and compresses it locally — headings kept in
+    full, body compressed with extractive summarization. No API cost, fast,
+    deterministic, so you can answer completely and keep your reply short.
+    max_chars caps the digest (1000..20000).
+    """
+    max_chars = max(1000, min(int(max_chars), 20000))
+    parts = _fetch_page_parts(url)
+    if parts is None:
+        return "Fetch failed: the page could not be downloaded."
+    headings, body = parts
+
+    head_block = ""
+    if headings:
+        head_block = "• " + "\n• ".join(headings) + "\n\n"
+    text = (head_block + body).strip()
+    if not text:
+        return "[Page contained no extractable text.]"
+    if len(text) <= max_chars:
+        return text  # already fits — no compression needed
+
+    body_budget = max(400, max_chars - len(head_block))
+    try:
+        digest = _sumy_digest(body, body_budget)
+    except Exception:
+        # Never crash the agent loop: raw excerpt fallback keeps coverage.
+        digest = f"[compression unavailable — raw excerpt]\n{body[:body_budget]}"
+    out = (head_block + digest).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip() + "\n…[digest trimmed]"
+    if len(out) < 200:
+        out = f"[compression produced little — raw excerpt]\n{text[:max_chars]}"
+    return out
 
 
 ALL_TOOLS = [web_search, web_fetch]
@@ -470,7 +644,7 @@ def edit_image(image_url: str, prompt: str) -> str:
         return f"Image edit failed: {e}"
 
 
-ALL_TOOLS = [web_search, web_fetch, youtube_transcript, run_code, generate_graph, generate_image, edit_image, send_file]
+ALL_TOOLS = [web_search, web_fetch, summarize_page, youtube_transcript, run_code, generate_graph, generate_image, edit_image, send_file]
 
 
 @function_tool
@@ -497,6 +671,13 @@ async def search_cache(query: str) -> str:
 
 
 # ── Client factories ──────────────────────────────────────────────
+
+
+def _exc_str(e: Exception) -> str:
+    """Type-annotated exception string — str(e) is empty for TimeoutError,
+    CancelledError, and bare RuntimeError(), which made logs read 'failed ()'."""
+    msg = str(e).strip()
+    return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
 
 
 def _wrap_error_detection(client: AsyncOpenAI) -> AsyncOpenAI:
@@ -867,7 +1048,7 @@ async def call_cheap_raw(
             return resp, fallback
         except Exception as e:
             last_err = e
-            logger.warning("Cheap raw fallback %s also failed: %s", fallback, e)
+            logger.warning("Cheap raw fallback %s also failed: %s", fallback, _exc_str(e))
 
     raise last_err  # type: ignore[misc]
 
@@ -893,7 +1074,7 @@ async def call_expensive(
         )
         return text, model_id
     except Exception as e:
-        logger.warning(f"Expensive {model_id} failed ({e}), falling back to OpenRouter")
+        logger.warning(f"Expensive {model_id} failed ({_exc_str(e)}), falling back to OpenRouter")
 
     # Fallback: OpenRouter. Engy's native id (deepseek-v4-flash-0731) isn't
     # served by OpenRouter, so swap in the OpenRouter-equivalent model.
@@ -1086,7 +1267,7 @@ async def _call_expensive_raw(
         )
         return resp, model_id
     except Exception as e:
-        logger.warning(f"Expensive raw {model_id} failed ({e}), falling back to OpenRouter")
+        logger.warning(f"Expensive raw {model_id} failed ({_exc_str(e)}), falling back to OpenRouter")
 
     fallback_id = ENGY_FALLBACK_MODEL if model_id in ENGY_MODELS else model_id
     client = _build_cheap_client()
@@ -1152,7 +1333,7 @@ async def stream_expensive_full(
             )
         except Exception as e:
             logger.warning(
-                f"Expensive stream {model_id} with stream_options failed ({e}), "
+                f"Expensive stream {model_id} with stream_options failed ({_exc_str(e)}), "
                 "retrying without usage tracking"
             )
             try:
@@ -1166,7 +1347,7 @@ async def stream_expensive_full(
                 )
             except Exception as e2:
                 logger.warning(
-                    f"Expensive stream {model_id} failed ({e2}), falling back to OpenRouter"
+                    f"Expensive stream {model_id} failed ({_exc_str(e2)}), falling back to OpenRouter"
                 )
                 model_id = ENGY_FALLBACK_MODEL if model_id in ENGY_MODELS else model_id
                 client = _build_cheap_client()
