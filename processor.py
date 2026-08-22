@@ -79,16 +79,24 @@ def turns_to_string(turns: list[dict]) -> str:
 
 
 _SEARCH_QUERY_PROMPT = (
-    "You generate a search key for a semantic cache lookup. Rewrite the user's latest "
-    "message into ONE self-contained search query. Resolve pronouns and implicit references "
-    "(\"the first one\", \"that video\", \"he said\", \"number 5\") using the conversation "
-    "history. Resolve relative TIME references to ABSOLUTE dates using today's date "
-    "(\"this month\" → current month + year, \"today\" → full date, \"this year\" → the year). "
-    "If resolved references are provided, describe the topic using their titles. "
-    "KEEP any URLs from the original message in the output — they identify the exact source "
-    "and are needed for exact video-ID reuse. Include concrete topic words — names, titles, "
-    "subjects, entities — so the query is unambiguous on its own. Output ONLY the rewritten "
-    "query. No quotes, no markdown, no explanation, no preamble."
+    "You enrich a user message into a self-contained cache search key.\n\n"
+    "STEP 1 — COPY the user's latest message VERBATIM: every word, phrase, "
+    "template prefix (e.g. \"Summary of the YouTube video …\"), and spelling "
+    "exactly as written. Do NOT paraphrase, reorder, shorten, expand, or "
+    "correct anything.\n"
+    "STEP 2 — APPEND only the resolved context needed to make it "
+    "self-contained, after the verbatim copy:\n"
+    "- resolve pronouns/implicit references (\"the first one\", \"that video\", "
+    "\"he said\", \"number 5\") to their concrete referents from the "
+    "conversation history\n"
+    "- resolve relative TIME to ABSOLUTE dates using today's date (\"this "
+    "month\" → current month + year, \"today\" → full date, \"this year\" → the year)\n"
+    "- if resolved references are provided, append the topic described by "
+    "their titles\n"
+    "Keep any URLs from the original message. Add concrete topic words ONLY "
+    "by appending — never by replacing original words.\n"
+    "Output ONLY the enriched key: [verbatim original][appended context]. "
+    "No quotes, no markdown, no explanation, no preamble."
 )
 
 _URL_RE = _re.compile(r"https?://[^\s<>\"']+")
